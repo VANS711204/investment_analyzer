@@ -697,7 +697,7 @@ def build_unheld_status_display(stock_id, stock_name, asset_type, price):
                 "\u76ee\u524d\u5e02\u503c": 0,
                 "\u6301\u80a1\u4f54\u6bd4": "0.00%",
                 "\u672a\u5be6\u73fe\u640d\u76ca": "\u4e0d\u9069\u7528",
-                "\u5831\u916c\u7387": "\u4e0d\u9069\u7528",
+                "\u5e33\u9762\u5831\u916c\u7387": "\u4e0d\u9069\u7528",
             }
         ]
     )
@@ -792,6 +792,13 @@ def build_display_holdings(holdings):
     display["\u6210\u4ea4\u5747\u50f9"] = display["\u6210\u4ea4\u5747\u50f9"].apply(format_price)
     display["\u7e3d\u6295\u5165\u6210\u672c"] = display["\u7e3d\u6295\u5165\u6210\u672c"].apply(format_currency)
     display["\u5e73\u5747\u6210\u672c"] = display["\u5e73\u5747\u6210\u672c"].apply(format_price)
+    display = display.rename(
+        columns={
+            "\u5831\u916c\u7387": "\u5e33\u9762\u5831\u916c\u7387",
+            "\u9810\u4f30\u5831\u916c\u7387": "\u6263\u9664\u4ea4\u6613\u6210\u672c\u5f8c\u5831\u916c\u7387",
+            "\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b": "\u7e3d\u8cc7\u7522\u6bd4\u4f8b",
+        }
+    )
     return display[
         [
             "\u80a1\u7968\u4ee3\u865f",
@@ -811,45 +818,135 @@ def build_display_holdings(holdings):
             "\u9810\u4f30\u8ce3\u51fa\u8cbb\u7528",
             "\u672a\u5be6\u73fe\u640d\u76ca",
             "\u9810\u4f30\u640d\u76ca",
-            "\u5831\u916c\u7387",
-            "\u9810\u4f30\u5831\u916c\u7387",
+            "\u5e33\u9762\u5831\u916c\u7387",
+            "\u6263\u9664\u4ea4\u6613\u6210\u672c\u5f8c\u5831\u916c\u7387",
             "\u6301\u80a1\u4f54\u6bd4",
-            "\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b",
+            "\u7e3d\u8cc7\u7522\u6bd4\u4f8b",
         ]
     ]
 
 
-st.set_page_config(page_title="\u6295\u8cc7\u5206\u6790\u5de5\u5177", layout="wide")
-st.title("\u6295\u8cc7\u5206\u6790\u5de5\u5177")
+def build_today_conclusions(holdings, total_assets, cash_ratio, overall_return):
+    conclusions = []
+
+    if total_assets and cash_ratio < CASH_CRITICAL_THRESHOLD:
+        conclusions.append(
+            (
+                "error",
+                f"現金水位很低，目前約佔總資產 {cash_ratio * 100:.1f}%，強烈建議先保留資金，不要積極加碼。",
+            )
+        )
+    elif total_assets and cash_ratio < CASH_LOW_THRESHOLD:
+        conclusions.append(
+            (
+                "warning",
+                f"現金水位偏低，目前約佔總資產 {cash_ratio * 100:.1f}%，建議保留資金，不宜積極加碼。",
+            )
+        )
+
+    etf_high = holdings[
+        (holdings["類型"].eq("ETF / 債券 ETF"))
+        & (holdings["佔總資產比例"] >= ETF_CONCENTRATION_WARNING_THRESHOLD)
+    ]
+    if not etf_high.empty:
+        names = "、".join(etf_high["股票代號"].astype(str))
+        conclusions.append(("warning", f"{names} 等 ETF 比重偏高，後續加碼需要更保守。"))
+
+    stock_high = holdings[
+        (holdings["類型"].eq("個股"))
+        & (holdings["佔總資產比例"] >= STOCK_CONCENTRATION_WARNING_THRESHOLD)
+    ]
+    if not stock_high.empty:
+        names = "、".join(stock_high["股票代號"].astype(str))
+        conclusions.append(("warning", f"{names} 等單一個股集中度偏高，請注意波動風險。"))
+
+    if total_assets and overall_return > 0 and cash_ratio >= CASH_LOW_THRESHOLD:
+        conclusions.append(("success", "整體帳面報酬率為正，且現金水位仍有餘裕，可依原本計畫分批布局。"))
+
+    if not conclusions:
+        conclusions.append(("info", "目前沒有明顯集中或現金水位警訊，可以先維持觀察並按計畫調整。"))
+
+    return conclusions
+
+
+def build_watchlist(holdings):
+    watch_rows = []
+
+    for _, row in holdings.iterrows():
+        reasons = []
+        actions = []
+        stock_id = row["股票代號"]
+        stock_name = row["股票名稱"]
+        asset_type = row["類型"]
+        return_rate = row["報酬率"]
+        asset_ratio = row["佔總資產比例"]
+
+        if pd.isna(row["現價"]):
+            reasons.append("現價無法取得")
+            actions.append("先確認報價來源或股票代號")
+        if not pd.isna(return_rate) and return_rate < -0.20:
+            reasons.append(f"帳面報酬率低於 -20%（約 {return_rate * 100:.1f}%）")
+            actions.append("先檢查基本面，不建議只因跌深而攤平")
+        if not pd.isna(return_rate) and return_rate > 0.20:
+            reasons.append(f"帳面報酬率高於 20%（約 {return_rate * 100:.1f}%）")
+            actions.append("可檢視是否需要分批停利或調節")
+        if asset_type == "個股" and not pd.isna(asset_ratio) and asset_ratio > STOCK_CONCENTRATION_WARNING_THRESHOLD:
+            reasons.append(f"單一個股佔總資產超過 15%（約 {asset_ratio * 100:.1f}%）")
+            actions.append("降低單一個股集中風險")
+        if (
+            asset_type == "ETF / 債券 ETF"
+            and not pd.isna(asset_ratio)
+            and asset_ratio > ETF_CONCENTRATION_WARNING_THRESHOLD
+        ):
+            reasons.append(f"單一 ETF 佔總資產超過 30%（約 {asset_ratio * 100:.1f}%）")
+            actions.append("後續加碼保守，避免配置過度集中")
+
+        if reasons:
+            watch_rows.append(
+                {
+                    "股票代號": stock_id,
+                    "股票名稱": stock_name,
+                    "原因": "；".join(reasons),
+                    "建議動作": "；".join(dict.fromkeys(actions)),
+                }
+            )
+
+    return pd.DataFrame(watch_rows, columns=["股票代號", "股票名稱", "原因", "建議動作"])
+
+
+st.set_page_config(page_title="投資分析工具", layout="wide")
+st.title("投資分析工具")
 st.warning(
-    "\u672c\u5de5\u5177\u70ba\u898f\u5247\u5f0f\u6295\u8cc7\u8f14\u52a9\u5206\u6790\uff0c"
-    "\u4e26\u975e\u4fdd\u8b49\u7372\u5229\u6216\u6b63\u5f0f\u6295\u8cc7\u5efa\u8b70\u3002"
-    "\u73fe\u50f9\u8cc7\u6599\u4f86\u6e90\u53ef\u80fd\u5ef6\u9072\uff0c"
-    "\u5be6\u969b\u4e0b\u55ae\u524d\u8acb\u4ee5\u5238\u5546\u5831\u50f9\u70ba\u6e96\u3002"
+    "本工具為規則式投資輔助分析，並非保證獲利或正式投資建議。"
+    "現價資料來源可能延遲，實際下單前請以券商報價為準。"
 )
 st.info(
-    "\u76ee\u524d\u6210\u672c\u63a1 FIFO \u5148\u9032\u5148\u51fa\u6cd5\u4f30\u7b97\uff0c"
-    "\u82e5\u5238\u5546\u6210\u672c\u8a08\u7b97\u65b9\u5f0f\u4e0d\u540c\uff0c"
-    "\u7d50\u679c\u53ef\u80fd\u8207\u5238\u5546 App \u7565\u6709\u5dee\u7570\u3002"
+    "目前成本採 FIFO 先進先出法估算；若券商成本計算方式不同，結果可能與券商 App 略有差異。"
 )
 st.info(
-    "\u73fe\u50f9\u8cc7\u6599\u4f86\u6e90\u70ba yfinance\uff0c"
-    "\u53ef\u80fd\u4e0d\u662f\u5373\u6642\u5831\u50f9\uff0c\u50c5\u4f9b\u4f30\u7b97\u53c3\u8003\u3002"
+    "現價會優先嘗試台灣證交所 / 櫃買中心報價，再使用 yfinance 備援；資料可能不是即時報價，僅供估算參考。"
 )
 st.info(
-    "\u9810\u4f30\u640d\u76ca\u5df2\u6263\u9664\u4f30\u7b97\u8ce3\u51fa\u624b\u7e8c\u8cbb\u8207\u4ea4\u6613\u7a05\uff1b"
-    "\u624b\u7e8c\u8cbb\u4ee5 0.1425% \u4f30\u7b97\uff0cETF \u4ea4\u6613\u7a05\u4ee5 0.1% \u4f30\u7b97\uff0c"
-    "\u4e00\u822c\u80a1\u7968\u4ea4\u6613\u7a05\u4ee5 0.3% \u4f30\u7b97\u3002"
+    "預估損益已扣除估算賣出手續費與交易稅；手續費以 0.1425% 估算，"
+    "ETF 交易稅以 0.1% 估算，一般股票交易稅以 0.3% 估算。"
+)
+st.info(
+    "帳面報酬率：只看目前市值與成本的差異。\n\n"
+    "扣除交易成本後報酬率：估算如果賣出後，扣除手續費與交易稅後的結果。\n\n"
+    "持股佔比：看這檔標的在所有股票裡佔多少。\n\n"
+    "總資產比例：看這檔標的在股票加現金總資產裡佔多少。"
 )
 
 settings = load_settings()
 saved_cash = float(settings.get("cash", 0.0))
-cash = st.number_input("\u73fe\u91d1", min_value=0.0, value=saved_cash, step=1000.0)
-if st.button("\u4fdd\u5b58\u73fe\u91d1"):
+cash = st.number_input("現金", min_value=0.0, value=saved_cash, step=1000.0)
+
+control_columns = st.columns([1, 1, 6])
+if control_columns[0].button("保存現金"):
     settings["cash"] = cash
     save_settings(settings)
-    st.success("\u73fe\u91d1\u5df2\u4fdd\u5b58\u5230 settings.json")
-if st.button("\u91cd\u65b0\u8b80\u53d6\u8cc7\u6599"):
+    st.success("現金已保存，下次開啟會自動帶入。")
+if control_columns[1].button("重新讀取資料"):
     st.cache_data.clear()
     st.rerun()
 
@@ -858,300 +955,290 @@ transactions_df, csv_error = read_holdings_csv(HOLDINGS_CSV_URL)
 if transactions_df is not None:
     st.session_state["last_successful_transactions_df"] = transactions_df.copy()
     save_transactions_cache(transactions_df)
-    st.success("Google \u8a66\u7b97\u8868\u8b80\u53d6\u6210\u529f")
+    st.success("Google 試算表讀取成功")
 else:
     st.error(
-        "Google \u8a66\u7b97\u8868 CSV \u8b80\u53d6\u5931\u6557\uff1a"
+        "Google 試算表 CSV 讀取失敗："
         + str(csv_error)
-        + "\n\n\u53ef\u80fd\u539f\u56e0\uff1a\n"
-        + "- \u7db2\u8def\u66ab\u6642\u4e2d\u65b7\n"
-        + "- Google \u8a66\u7b97\u8868 CSV \u9023\u7d50\u7121\u6cd5\u9023\u7dda\n"
-        + "- \u516c\u53f8\u9632\u706b\u7246\u6216\u9632\u6bd2\u8edf\u9ad4\u53ef\u80fd\u963b\u64cb Python \u9023\u7dda"
+        + "\n\n可能原因：\n"
+        + "- 網路暫時中斷\n"
+        + "- Google 試算表 CSV 連結無法連線\n"
+        + "- 公司防火牆或防毒軟體可能阻擋 Python 連線"
     )
 
     if "last_successful_transactions_df" in st.session_state:
         transactions_df = st.session_state["last_successful_transactions_df"].copy()
-        st.warning("\u76ee\u524d\u4f7f\u7528\u4e0a\u4e00\u6b21\u6210\u529f\u8b80\u53d6\u7684\u8cc7\u6599")
+        st.warning("目前使用上一次成功讀取的資料")
     else:
         cached_transactions_df = load_transactions_cache()
         if cached_transactions_df is not None:
             transactions_df = cached_transactions_df
             st.session_state["last_successful_transactions_df"] = transactions_df.copy()
-            st.warning("\u76ee\u524d\u4f7f\u7528\u672c\u6a5f\u4e0a\u4e00\u6b21\u6210\u529f\u8b80\u53d6\u7684\u5feb\u53d6\u8cc7\u6599")
+            st.warning("目前使用本機上一次成功讀取的快取資料")
         else:
-            st.error("\u5c1a\u672a\u6709\u6210\u529f\u8b80\u53d6\u904e\u7684 Google CSV \u8cc7\u6599\uff0c\u76ee\u524d\u7121\u6cd5\u5206\u6790\u3002")
+            st.error("尚未有成功讀取過的 Google CSV 資料，目前無法分析。")
             st.stop()
 
 missing_columns = [column for column in REQUIRED_COLUMNS if column not in transactions_df.columns]
 
 if missing_columns:
-    st.error("\u4ea4\u6613\u7d00\u9304\u7f3a\u5c11\u5fc5\u8981\u6b04\u4f4d\uff1a" + "\u3001".join(missing_columns))
+    st.error("交易紀錄缺少必要欄位：" + "、".join(missing_columns))
     st.stop()
 
 working_df = transactions_df.copy()
 for column in NUMERIC_COLUMNS:
     working_df[column] = parse_number(working_df[column])
 
-working_df["\u4ea4\u6613\u5206\u985e"] = working_df["\u4ea4\u6613\u5225"].apply(classify_transaction)
-working_df["\u4ea4\u6613\u65e5\u671f_\u6392\u5e8f"] = pd.to_datetime(
-    working_df["\u4ea4\u6613\u65e5\u671f"],
-    errors="coerce",
-)
-working_df["\u539f\u59cb\u9806\u5e8f"] = range(len(working_df))
-working_df = working_df.sort_values(
-    ["\u4ea4\u6613\u65e5\u671f_\u6392\u5e8f", "\u539f\u59cb\u9806\u5e8f"],
-    na_position="last",
-)
+working_df["交易分類"] = working_df["交易別"].apply(classify_transaction)
+working_df["交易日期_排序"] = pd.to_datetime(working_df["交易日期"], errors="coerce")
+working_df["原始順序"] = range(len(working_df))
+working_df = working_df.sort_values(["交易日期_排序", "原始順序"], na_position="last")
 
-included_transactions_df = working_df[working_df["\u4ea4\u6613\u5206\u985e"].isin(["\u8cb7\u9032", "\u8ce3\u51fa"])]
-excluded_transactions_df = working_df[working_df["\u4ea4\u6613\u5206\u985e"] == "\u672a\u7d0d\u5165"]
+included_transactions_df = working_df[working_df["交易分類"].isin(["買進", "賣出"])]
+excluded_transactions_df = working_df[working_df["交易分類"] == "未納入"]
 holdings_df = build_holdings(included_transactions_df)
 holdings_df = add_price_analysis(holdings_df, cash)
 
-stock_market_value = holdings_df["\u76ee\u524d\u5e02\u503c"].sum(skipna=True)
-total_cost = holdings_df["\u7e3d\u6295\u5165\u6210\u672c"].sum()
-total_unrealized_profit = holdings_df["\u672a\u5be6\u73fe\u640d\u76ca"].sum(skipna=True)
-total_estimated_profit = holdings_df["\u9810\u4f30\u640d\u76ca"].sum(skipna=True)
+stock_market_value = holdings_df["目前市值"].sum(skipna=True)
+total_cost = holdings_df["總投入成本"].sum()
+total_unrealized_profit = holdings_df["未實現損益"].sum(skipna=True)
+total_estimated_profit = holdings_df["預估損益"].sum(skipna=True)
 overall_return = total_unrealized_profit / total_cost if total_cost else 0
 estimated_return = total_estimated_profit / total_cost if total_cost else 0
 total_assets = stock_market_value + cash
 cash_ratio = cash / total_assets if total_assets else 0
 
-metric_row_1 = st.columns(4)
-metric_row_1[0].metric("\u80a1\u7968\u7e3d\u5e02\u503c", format_currency(stock_market_value))
-metric_row_1[1].metric("\u7e3d\u6295\u5165\u6210\u672c", format_currency(total_cost))
-metric_row_1[2].metric("\u7e3d\u672a\u5be6\u73fe\u640d\u76ca", format_currency(total_unrealized_profit))
-metric_row_1[3].metric("\u7e3d\u9810\u4f30\u640d\u76ca", format_currency(total_estimated_profit))
+st.header("投資總覽")
+overview_row_1 = st.columns(3)
+overview_row_1[0].metric("總資產", format_currency(total_assets))
+overview_row_1[1].metric("股票總市值", format_currency(stock_market_value))
+overview_row_1[2].metric("現金", format_currency(cash))
 
-metric_row_2 = st.columns(4)
-metric_row_2[0].metric("\u6574\u9ad4\u5831\u916c\u7387", format_percent(overall_return))
-metric_row_2[1].metric("\u9810\u4f30\u5831\u916c\u7387", format_percent(estimated_return))
-metric_row_2[2].metric("\u73fe\u91d1", format_currency(cash))
-metric_row_2[3].metric("\u7e3d\u8cc7\u7522", format_currency(total_assets))
+overview_row_2 = st.columns(3)
+overview_row_2[0].metric("帳面損益", format_currency(total_unrealized_profit))
+overview_row_2[1].metric("整體帳面報酬率", format_percent(overall_return))
+overview_row_2[2].metric("預估實際損益", format_currency(total_estimated_profit))
 
-if total_assets and cash_ratio < CASH_CRITICAL_THRESHOLD:
-    st.error(
-        "\u73fe\u91d1\u6c34\u4f4d\u904e\u4f4e\uff0c\u5f37\u70c8\u63d0\u9192\u4e0d\u8981\u7a4d\u6975\u52a0\u78bc\u3002"
-        f"\u76ee\u524d\u73fe\u91d1\u4f54\u7e3d\u8cc7\u7522\u7d04 {cash_ratio * 100:.1f}%\u3002"
-    )
-elif total_assets and cash_ratio < CASH_LOW_THRESHOLD:
-    st.warning(
-        "\u73fe\u91d1\u6c34\u4f4d\u504f\u4f4e\uff0c\u4e0d\u5efa\u8b70\u7a4d\u6975\u52a0\u78bc\u3002"
-        f"\u76ee\u524d\u73fe\u91d1\u4f54\u7e3d\u8cc7\u7522\u7d04 {cash_ratio * 100:.1f}%\u3002"
-    )
+st.header("今日重點結論")
+for level, message in build_today_conclusions(holdings_df, total_assets, cash_ratio, overall_return):
+    if level == "error":
+        st.error(message)
+    elif level == "warning":
+        st.warning(message)
+    elif level == "success":
+        st.success(message)
+    else:
+        st.info(message)
 
-st.subheader("\u6a21\u64ec\u4ea4\u6613")
-simulation_stock_id = st.text_input("\u80a1\u7968\u4ee3\u865f", value="", placeholder="\u4f8b\u5982\uff1a0050\u30012330\u300100679B")
-current_holding = find_holding(holdings_df, simulation_stock_id)
+st.header("買入 / 賣出模擬器")
+st.caption("集中度提醒：個股 15% 提醒、20% 不建議加碼；ETF 30% 提醒、35% 不建議加碼。")
+simulator_columns = st.columns([1, 1, 1])
+simulation_action = simulator_columns[0].selectbox("操作類型", ["買進", "賣出", "只查詢"])
+simulation_stock_id = simulator_columns[1].text_input("股票代號", value="", placeholder="例如：0050、2330、00679B")
 
-st.caption(
-    "\u96c6\u4e2d\u5ea6\u63d0\u9192\uff1a\u500b\u80a1 15% \u63d0\u9192\u300120% \u4e0d\u5efa\u8b70\u52a0\u78bc\uff1b"
-    "ETF 30% \u63d0\u9192\u300135% \u4e0d\u5efa\u8b70\u52a0\u78bc\u3002"
-)
+simulation_stock_id = simulation_stock_id.strip().upper()
+current_holding = find_holding(holdings_df, simulation_stock_id) if simulation_stock_id else None
 
-if simulation_stock_id.strip():
-    simulation_stock_id = simulation_stock_id.strip().upper()
+if simulation_stock_id:
     lookup_price = (
-        float(current_holding["\u73fe\u50f9"])
-        if current_holding is not None and not pd.isna(current_holding["\u73fe\u50f9"])
+        float(current_holding["現價"])
+        if current_holding is not None and not pd.isna(current_holding["現價"])
         else get_current_price(simulation_stock_id)
     )
 
     if lookup_price is None or pd.isna(lookup_price):
-        st.error("\u7121\u6cd5\u53d6\u5f97\u6b64\u80a1\u7968\u73fe\u50f9\uff0c\u8acb\u78ba\u8a8d\u4ee3\u865f\u662f\u5426\u6b63\u78ba")
+        st.error("無法取得此股票現價，請確認代號是否正確。")
 
     if current_holding is not None:
-        st.markdown("**\u5df2\u6301\u6709\u6a19\u7684\u5206\u6790**")
+        st.subheader("已持有標的分析")
         held_status = pd.DataFrame(
             [
                 {
-                    "\u80a1\u7968\u540d\u7a31": current_holding["\u80a1\u7968\u540d\u7a31"],
-                    "\u76ee\u524d\u6301\u6709\u80a1\u6578": current_holding["\u6301\u6709\u80a1\u6578"],
-                    "\u5e73\u5747\u6210\u672c": format_price(current_holding["\u5e73\u5747\u6210\u672c"]),
-                    "\u73fe\u50f9": format_price(current_holding["\u73fe\u50f9"]),
-                    "\u672a\u5be6\u73fe\u640d\u76ca": format_currency(current_holding["\u672a\u5be6\u73fe\u640d\u76ca"]),
-                    "\u5831\u916c\u7387": format_percent(current_holding["\u5831\u916c\u7387"]),
-                    "\u6301\u80a1\u4f54\u6bd4": format_percent(current_holding["\u6301\u80a1\u4f54\u6bd4"]),
-                    "\u64cd\u4f5c\u5efa\u8b70": current_holding["\u64cd\u4f5c\u5efa\u8b70"],
-                    "\u5efa\u8b70\u7406\u7531": current_holding["\u5efa\u8b70\u7406\u7531"],
+                    "股票名稱": current_holding["股票名稱"],
+                    "目前持有股數": current_holding["持有股數"],
+                    "平均成本": format_price(current_holding["平均成本"]),
+                    "現價": format_price(current_holding["現價"]),
+                    "未實現損益": format_currency(current_holding["未實現損益"]),
+                    "帳面報酬率": format_percent(current_holding["報酬率"]),
+                    "持股佔比": format_percent(current_holding["持股佔比"]),
+                    "操作建議": current_holding["操作建議"],
+                    "建議理由": current_holding["建議理由"],
                 }
             ]
         )
         st.dataframe(held_status, use_container_width=True)
+        st.info(f"{simulation_stock_id} 已在持股中，目前建議是「{current_holding['操作建議']}」。{current_holding['建議理由']}")
 
-        simulation_row_1 = st.columns(3)
-        simulation_action = simulation_row_1[0].selectbox(
-            "\u60f3\u8cb7 / \u60f3\u8ce3",
-            ["\u8cb7\u9032", "\u8ce3\u51fa"],
-        )
-        simulation_price = simulation_row_1[1].number_input(
-            "\u6a21\u64ec\u6210\u4ea4\u50f9",
-            min_value=0.0,
-            value=float(lookup_price) if lookup_price else 0.0,
-            step=0.01,
-        )
-        simulation_quantity = simulation_row_1[2].number_input(
-            "\u6a21\u64ec\u5f35\u6578",
-            min_value=0.0,
-            value=1.0,
-            step=1.0,
-        )
-        simulation_quantity = simulation_quantity * SHARES_PER_LOT
-
-        if simulation_price > 0 and simulation_quantity > 0:
-            simulation_market_value = simulation_price * simulation_quantity
-            simulation_brokerage_fee, simulation_transaction_tax = estimate_trade_fee(
-                simulation_stock_id,
-                simulation_market_value,
-                simulation_action,
+        if simulation_action == "只查詢":
+            st.success("這次只查詢，不改變現金與持股；可用上方資料判斷是否需要後續操作。")
+        else:
+            input_columns = st.columns(2)
+            simulation_price = input_columns[0].number_input(
+                "模擬成交價",
+                min_value=0.0,
+                value=float(lookup_price) if lookup_price else 0.0,
+                step=0.01,
             )
-            simulation_total_fee = simulation_brokerage_fee + simulation_transaction_tax
-
-            if simulation_action == "\u8cb7\u9032":
-                simulated_cash = cash - simulation_market_value - simulation_brokerage_fee
+            if simulation_action == "買進":
+                simulation_lots = input_columns[1].number_input("預計買入張數", min_value=0.0, value=1.0, step=1.0)
+                simulation_quantity = simulation_lots * SHARES_PER_LOT
             else:
-                holding_quantity = float(current_holding["\u6301\u6709\u80a1\u6578"])
-                if simulation_quantity > holding_quantity:
-                    st.warning("\u6a21\u64ec\u8ce3\u51fa\u80a1\u6578\u5927\u65bc\u76ee\u524d\u6301\u6709\u80a1\u6578\u3002")
-                simulated_cash = cash + simulation_market_value - simulation_total_fee
+                simulation_quantity = input_columns[1].number_input(
+                    "預計賣出股數",
+                    min_value=0.0,
+                    value=0.0,
+                    step=100.0,
+                )
 
-            simulated_holdings = build_simulated_holdings(
-                holdings_df,
-                simulation_stock_id,
-                str(current_holding["\u80a1\u7968\u540d\u7a31"]),
-                simulation_action,
-                simulation_quantity,
-                simulation_price,
-            )
-            simulated_stock_market_value = simulated_holdings["\u6a21\u64ec\u5f8c\u5e02\u503c"].sum(skipna=True)
-            simulated_total_assets = simulated_stock_market_value + simulated_cash
-            simulated_holdings["\u985e\u578b"] = simulated_holdings.apply(classify_asset_type, axis=1)
+            if simulation_price > 0 and simulation_quantity > 0:
+                simulation_market_value = simulation_price * simulation_quantity
+                simulation_brokerage_fee, simulation_transaction_tax = estimate_trade_fee(
+                    simulation_stock_id,
+                    simulation_market_value,
+                    simulation_action,
+                )
+                simulation_total_fee = simulation_brokerage_fee + simulation_transaction_tax
 
-            simulation_metrics = st.columns(5)
-            simulation_metrics[0].metric("\u6a21\u64ec\u4ea4\u6613\u91d1\u984d", format_currency(simulation_market_value))
-            simulation_metrics[1].metric("\u4f30\u7b97\u624b\u7e8c\u8cbb", format_currency(simulation_brokerage_fee))
-            simulation_metrics[2].metric("\u4f30\u7b97\u4ea4\u6613\u7a05", format_currency(simulation_transaction_tax))
-            simulation_metrics[3].metric("\u6a21\u64ec\u5f8c\u73fe\u91d1", format_currency(simulated_cash))
-            simulation_metrics[4].metric("\u6a21\u64ec\u5f8c\u7e3d\u8cc7\u7522", format_currency(simulated_total_assets))
+                if simulation_action == "買進":
+                    simulated_cash = cash - simulation_market_value - simulation_brokerage_fee
+                    plain_result = (
+                        f"若買進 {simulation_quantity:,.0f} 股，約需 {format_currency(simulation_market_value + simulation_brokerage_fee)} 元，"
+                        f"交易後現金約為 {format_currency(simulated_cash)} 元。"
+                    )
+                else:
+                    holding_quantity = float(current_holding["持有股數"])
+                    if simulation_quantity > holding_quantity:
+                        st.warning("模擬賣出股數大於目前持有股數，請確認是否輸入過多。")
+                    simulated_cash = cash + simulation_market_value - simulation_total_fee
+                    plain_result = (
+                        f"若賣出 {simulation_quantity:,.0f} 股，扣除估算費稅後，交易後現金約為 "
+                        f"{format_currency(simulated_cash)} 元。"
+                    )
 
-            no_add_rows = simulated_holdings[
-                (
-                    (simulated_holdings["\u985e\u578b"].eq("\u500b\u80a1"))
-                    & (simulated_holdings["\u6a21\u64ec\u5f8c\u6301\u80a1\u4f54\u6bd4"] >= STOCK_NO_ADD_THRESHOLD)
+                simulated_holdings = build_simulated_holdings(
+                    holdings_df,
+                    simulation_stock_id,
+                    str(current_holding["股票名稱"]),
+                    simulation_action,
+                    simulation_quantity,
+                    simulation_price,
                 )
-                | (
-                    (simulated_holdings["\u985e\u578b"].eq("ETF / \u50b5\u5238 ETF"))
-                    & (simulated_holdings["\u6a21\u64ec\u5f8c\u6301\u80a1\u4f54\u6bd4"] >= ETF_NO_ADD_THRESHOLD)
-                )
-            ]
-            warning_rows = simulated_holdings[
-                (
-                    (simulated_holdings["\u985e\u578b"].eq("\u500b\u80a1"))
-                    & (simulated_holdings["\u6a21\u64ec\u5f8c\u6301\u80a1\u4f54\u6bd4"] >= STOCK_CONCENTRATION_WARNING_THRESHOLD)
-                )
-                | (
-                    (simulated_holdings["\u985e\u578b"].eq("ETF / \u50b5\u5238 ETF"))
-                    & (simulated_holdings["\u6a21\u64ec\u5f8c\u6301\u80a1\u4f54\u6bd4"] >= ETF_CONCENTRATION_WARNING_THRESHOLD)
-                )
-            ]
+                simulated_stock_market_value = simulated_holdings["模擬後市值"].sum(skipna=True)
+                simulated_total_assets = simulated_stock_market_value + simulated_cash
+                simulated_holdings["類型"] = simulated_holdings.apply(classify_asset_type, axis=1)
 
-            if not no_add_rows.empty:
-                concentrated_rows = no_add_rows
-                concentrated_names = "\u3001".join(
-                    concentrated_rows["\u80a1\u7968\u4ee3\u865f"].astype(str)
-                    + " "
-                    + concentrated_rows["\u80a1\u7968\u540d\u7a31"].astype(str)
-                )
-                st.warning(
-                    "\u4e0d\u5efa\u8b70\u52a0\u78bc\uff1a"
-                    + concentrated_names
-                    + "\u7684\u6a21\u64ec\u5f8c\u6bd4\u91cd\u5df2\u9054\u904e\u9ad8\u9580\u6abb\u3002"
-                )
-            elif not warning_rows.empty:
-                concentrated_rows = warning_rows
-                concentrated_names = "\u3001".join(
-                    concentrated_rows["\u80a1\u7968\u4ee3\u865f"].astype(str)
-                    + " "
-                    + concentrated_rows["\u80a1\u7968\u540d\u7a31"].astype(str)
-                )
-                st.warning("\u96c6\u4e2d\u5ea6\u63d0\u9192\uff1a" + concentrated_names + "\u7684\u6a21\u64ec\u5f8c\u6bd4\u91cd\u504f\u9ad8\u3002")
-            else:
-                st.success("\u6a21\u64ec\u5f8c\u672a\u89f8\u767c\u96c6\u4e2d\u5ea6\u63d0\u9192\u3002")
+                simulation_metrics = st.columns(5)
+                simulation_metrics[0].metric("模擬交易金額", format_currency(simulation_market_value))
+                simulation_metrics[1].metric("估算手續費", format_currency(simulation_brokerage_fee))
+                simulation_metrics[2].metric("估算交易稅", format_currency(simulation_transaction_tax))
+                simulation_metrics[3].metric("模擬後現金", format_currency(simulated_cash))
+                simulation_metrics[4].metric("模擬後總資產", format_currency(simulated_total_assets))
 
-            if simulated_cash < 0:
-                st.warning("\u6a21\u64ec\u5f8c\u73fe\u91d1\u70ba\u8ca0\u6578\uff0c\u8acb\u78ba\u8a8d\u8cc7\u91d1\u662f\u5426\u8db3\u5920\u3002")
+                st.info(plain_result)
 
-            st.dataframe(build_simulation_display(simulated_holdings), use_container_width=True)
+                no_add_rows = simulated_holdings[
+                    (
+                        (simulated_holdings["類型"].eq("個股"))
+                        & (simulated_holdings["模擬後持股佔比"] >= STOCK_NO_ADD_THRESHOLD)
+                    )
+                    | (
+                        (simulated_holdings["類型"].eq("ETF / 債券 ETF"))
+                        & (simulated_holdings["模擬後持股佔比"] >= ETF_NO_ADD_THRESHOLD)
+                    )
+                ]
+                warning_rows = simulated_holdings[
+                    (
+                        (simulated_holdings["類型"].eq("個股"))
+                        & (simulated_holdings["模擬後持股佔比"] >= STOCK_CONCENTRATION_WARNING_THRESHOLD)
+                    )
+                    | (
+                        (simulated_holdings["類型"].eq("ETF / 債券 ETF"))
+                        & (simulated_holdings["模擬後持股佔比"] >= ETF_CONCENTRATION_WARNING_THRESHOLD)
+                    )
+                ]
+
+                if not no_add_rows.empty:
+                    names = "、".join(no_add_rows["股票代號"].astype(str) + " " + no_add_rows["股票名稱"].astype(str))
+                    st.warning("模擬後部位偏集中，" + names + " 已達不建議加碼門檻。")
+                elif not warning_rows.empty:
+                    names = "、".join(warning_rows["股票代號"].astype(str) + " " + warning_rows["股票名稱"].astype(str))
+                    st.warning("模擬後需要留意集中度：" + names + " 的比重偏高。")
+                else:
+                    st.success("模擬後沒有觸發集中度警訊。")
+
+                if simulated_cash < 0:
+                    st.warning("模擬後現金會變成負數，代表資金不足或需要降低交易金額。")
+
+                st.dataframe(build_simulation_display(simulated_holdings), use_container_width=True)
     else:
-        st.markdown("**\u672a\u6301\u6709\u6a19\u7684\u8cb7\u5165\u5206\u6790**")
-        lookup_name = get_stock_name(simulation_stock_id) or "\u672a\u6301\u6709\u6a19\u7684"
-        unheld_asset_type = classify_asset_type(
-            pd.Series(
-                {
-                    "\u80a1\u7968\u4ee3\u865f": simulation_stock_id,
-                    "\u80a1\u7968\u540d\u7a31": lookup_name,
-                }
-            )
-        )
+        st.subheader("未持有標的買入分析")
+        lookup_name = get_stock_name(simulation_stock_id) or "未持有標的"
+        unheld_asset_type = classify_asset_type(pd.Series({"股票代號": simulation_stock_id, "股票名稱": lookup_name}))
         st.dataframe(
             build_unheld_status_display(simulation_stock_id, lookup_name, unheld_asset_type, lookup_price),
             use_container_width=True,
         )
 
-        planned_buy_columns = st.columns(2)
-        planned_buy_lots = planned_buy_columns[0].number_input(
-            "\u9810\u8a08\u8cb7\u5165\u5f35\u6578",
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
-        )
-        planned_buy_amount_input = planned_buy_columns[1].number_input(
-            "\u9810\u8a08\u8cb7\u5165\u91d1\u984d",
-            min_value=0.0,
-            value=0.0,
-            step=1000.0,
-        )
-        planned_buy_amount = planned_buy_amount_input
-        if planned_buy_lots > 0 and lookup_price is not None and not pd.isna(lookup_price):
-            planned_buy_amount = planned_buy_lots * SHARES_PER_LOT * lookup_price
-
-        if planned_buy_amount > 0:
-            analysis = generate_unheld_buy_analysis(
-                simulation_stock_id,
-                lookup_name,
-                unheld_asset_type,
-                lookup_price,
-                planned_buy_amount,
-                cash,
-                stock_market_value,
+        if simulation_action == "賣出":
+            st.warning("這檔目前不在持股中，無法模擬賣出；可改用買進或只查詢。")
+        elif simulation_action == "只查詢":
+            st.info("這檔目前未持有，只能先依現價、現金與配置比例做初步觀察。")
+        else:
+            planned_buy_columns = st.columns(2)
+            planned_buy_lots = planned_buy_columns[0].number_input("預計買入張數", min_value=0.0, value=0.0, step=1.0)
+            planned_buy_amount_input = planned_buy_columns[1].number_input(
+                "預計投入金額",
+                min_value=0.0,
+                value=0.0,
+                step=1000.0,
             )
-            analysis_metrics = st.columns(7)
-            analysis_metrics[0].metric("\u9810\u8a08\u8cb7\u5165\u5f35\u6578", format_price(planned_buy_lots))
-            analysis_metrics[1].metric("\u9810\u4f30\u53ef\u8cb7\u5f35\u6578", format_price(analysis["\u9810\u4f30\u53ef\u8cb7\u5f35\u6578"]))
-            analysis_metrics[2].metric("\u9810\u4f30\u53ef\u8cb7\u80a1\u6578", format_price(analysis["\u9810\u4f30\u53ef\u8cb7\u80a1\u6578"]))
-            analysis_metrics[3].metric("\u8cb7\u5165\u5f8c\u8a72\u80a1\u7968\u5e02\u503c", format_currency(analysis["\u8cb7\u5165\u5f8c\u8a72\u80a1\u7968\u5e02\u503c"]))
-            analysis_metrics[4].metric("\u8cb7\u5165\u5f8c\u73fe\u91d1", format_currency(analysis["\u8cb7\u5165\u5f8c\u73fe\u91d1"]))
-            analysis_metrics[5].metric("\u8cb7\u5165\u5f8c\u7e3d\u8cc7\u7522", format_currency(analysis["\u8cb7\u5165\u5f8c\u7e3d\u8cc7\u7522"]))
-            analysis_metrics[6].metric(
-                "\u8cb7\u5165\u5f8c\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b",
-                format_percent(analysis["\u8cb7\u5165\u5f8c\u8a72\u80a1\u7968\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b"]),
-            )
-            if any(keyword in analysis["\u5efa\u8b70"] for keyword in ["\u4e0d\u5efa\u8b70", "\u504f\u9ad8", "\u904e\u9ad8", "\u4e0d\u8db3"]):
-                st.warning(analysis["\u5efa\u8b70"] + "\uff1a" + analysis["\u5efa\u8b70\u7406\u7531"])
-            else:
-                st.info(analysis["\u5efa\u8b70"] + "\uff1a" + analysis["\u5efa\u8b70\u7406\u7531"])
+            planned_buy_amount = planned_buy_amount_input
+            if planned_buy_lots > 0 and lookup_price is not None and not pd.isna(lookup_price):
+                planned_buy_amount = planned_buy_lots * SHARES_PER_LOT * lookup_price
 
-st.subheader("\u76ee\u524d\u6301\u80a1")
-st.dataframe(build_display_holdings(holdings_df), use_container_width=True)
+            if planned_buy_amount > 0:
+                analysis = generate_unheld_buy_analysis(
+                    simulation_stock_id,
+                    lookup_name,
+                    unheld_asset_type,
+                    lookup_price,
+                    planned_buy_amount,
+                    cash,
+                    stock_market_value,
+                )
+                analysis_metrics = st.columns(7)
+                analysis_metrics[0].metric("預計買入張數", format_price(planned_buy_lots))
+                analysis_metrics[1].metric("預估可買張數", format_price(analysis["預估可買張數"]))
+                analysis_metrics[2].metric("預估可買股數", format_price(analysis["預估可買股數"]))
+                analysis_metrics[3].metric("買入後該股票市值", format_currency(analysis["買入後該股票市值"]))
+                analysis_metrics[4].metric("買入後現金", format_currency(analysis["買入後現金"]))
+                analysis_metrics[5].metric("買入後總資產", format_currency(analysis["買入後總資產"]))
+                analysis_metrics[6].metric("買入後佔總資產比例", format_percent(analysis["買入後該股票佔總資產比例"]))
 
-st.subheader("\u672a\u7d0d\u5165\u6301\u80a1\u8a08\u7b97\u7684\u4ea4\u6613")
-st.dataframe(
-    excluded_transactions_df.drop(
-        columns=["\u4ea4\u6613\u65e5\u671f_\u6392\u5e8f", "\u539f\u59cb\u9806\u5e8f"],
-        errors="ignore",
-    ),
-    use_container_width=True,
-)
+                if any(keyword in analysis["建議"] for keyword in ["不建議", "偏高", "過高", "不足"]):
+                    st.warning(analysis["建議"] + "：" + analysis["建議理由"])
+                else:
+                    st.info(analysis["建議"] + "：" + analysis["建議理由"])
 
-st.subheader("\u539f\u59cb\u4ea4\u6613\u7d00\u9304")
-st.dataframe(transactions_df, use_container_width=True)
+st.header("需要注意的標的")
+watchlist_df = build_watchlist(holdings_df)
+if watchlist_df.empty:
+    st.success("目前沒有標的觸發注意條件。")
+else:
+    st.dataframe(watchlist_df, use_container_width=True)
+
+st.header("目前持股明細")
+st.caption("持股佔比：佔股票總市值比例。總資產比例：佔股票市值＋現金的比例。")
+with st.expander("查看完整持股明細"):
+    st.dataframe(build_display_holdings(holdings_df), use_container_width=True)
+
+st.header("未納入持股計算的交易")
+with st.expander("查看未納入持股計算的交易"):
+    st.dataframe(
+        excluded_transactions_df.drop(columns=["交易日期_排序", "原始順序"], errors="ignore"),
+        use_container_width=True,
+    )
+
+st.header("原始交易紀錄")
+with st.expander("查看原始交易紀錄"):
+    st.dataframe(transactions_df, use_container_width=True)
