@@ -50,23 +50,29 @@ NUMERIC_COLUMNS = [
     "\u4ea4\u6613\u7a05",
 ]
 
-REAL_ESTATE_REQUIRED_COLUMNS = [
+REAL_ESTATE_BASE_REQUIRED_COLUMNS = [
     "\u8cc7\u7522\u540d\u7a31",
     "\u985e\u578b",
     "\u623f\u7522\u73fe\u503c",
     "\u8cb8\u6b3e\u7e3d\u984d",
     "\u6708\u7e73\u91d1\u984d",
     "\u5e74\u5229\u7387",
-    "\u5269\u9918\u671f\u6578",
     "\u5099\u8a3b",
 ]
+
+REAL_ESTATE_NEW_SCHEDULE_COLUMNS = [
+    "\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f",
+    "\u8cb8\u6b3e\u5e74\u9650",
+]
+
+REAL_ESTATE_OLD_SCHEDULE_COLUMNS = ["\u5269\u9918\u671f\u6578"]
 
 REAL_ESTATE_NUMERIC_COLUMNS = [
     "\u623f\u7522\u73fe\u503c",
     "\u8cb8\u6b3e\u7e3d\u984d",
     "\u6708\u7e73\u91d1\u984d",
     "\u5e74\u5229\u7387",
-    "\u5269\u9918\u671f\u6578",
+    "\u8cb8\u6b3e\u5e74\u9650",
 ]
 
 EXCLUDED_TRANSACTION_KEYWORDS = [
@@ -194,12 +200,45 @@ def read_real_estate_csv():
     return None, f"pandas.read_csv: {pandas_error}；備援讀取: {fallback_error}"
 
 
+def calculate_elapsed_months(start_dates, today=None):
+    today = today or pd.Timestamp.today().normalize()
+    start_dates = pd.to_datetime(start_dates, errors="coerce")
+    elapsed = (today.year - start_dates.dt.year) * 12 + (today.month - start_dates.dt.month)
+    elapsed = elapsed.where(today.day >= start_dates.dt.day, elapsed - 1)
+    return elapsed.clip(lower=0).fillna(0)
+
+
 def build_real_estate_analysis(real_estate_df):
     real_estate = real_estate_df.copy()
     for column in REAL_ESTATE_NUMERIC_COLUMNS:
-        real_estate[column] = parse_number(real_estate[column])
+        if column in real_estate.columns:
+            real_estate[column] = parse_number(real_estate[column])
 
-    real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"] = real_estate["\u6708\u7e73\u91d1\u984d"] * real_estate["\u5269\u9918\u671f\u6578"]
+    if "\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f" in real_estate.columns:
+        parsed_start_dates = pd.to_datetime(real_estate["\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f"], errors="coerce")
+        real_estate["\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f"] = parsed_start_dates.dt.strftime("%Y-%m-%d").fillna(
+            real_estate["\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f"].astype(str)
+        )
+    else:
+        parsed_start_dates = pd.Series(pd.NaT, index=real_estate.index)
+        real_estate["\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f"] = "\u820a\u6b04\u4f4d\u672a\u63d0\u4f9b"
+
+    if "\u8cb8\u6b3e\u5e74\u9650" not in real_estate.columns:
+        real_estate["\u8cb8\u6b3e\u5e74\u9650"] = pd.NA
+
+    if all(column in real_estate_df.columns for column in REAL_ESTATE_NEW_SCHEDULE_COLUMNS):
+        total_periods = real_estate["\u8cb8\u6b3e\u5e74\u9650"] * 12
+        elapsed_periods = calculate_elapsed_months(parsed_start_dates)
+        real_estate["\u7e3d\u671f\u6578"] = total_periods
+        real_estate["\u5df2\u904e\u671f\u6578"] = elapsed_periods
+        real_estate["\u81ea\u52d5\u8a08\u7b97\u5269\u9918\u671f\u6578"] = (total_periods - elapsed_periods).clip(lower=0)
+    else:
+        real_estate["\u5269\u9918\u671f\u6578"] = parse_number(real_estate["\u5269\u9918\u671f\u6578"])
+        real_estate["\u7e3d\u671f\u6578"] = pd.NA
+        real_estate["\u5df2\u904e\u671f\u6578"] = pd.NA
+        real_estate["\u81ea\u52d5\u8a08\u7b97\u5269\u9918\u671f\u6578"] = real_estate["\u5269\u9918\u671f\u6578"].clip(lower=0)
+
+    real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"] = real_estate["\u6708\u7e73\u91d1\u984d"] * real_estate["\u81ea\u52d5\u8a08\u7b97\u5269\u9918\u671f\u6578"]
     real_estate["\u6bcf\u5e74\u623f\u8cb8\u652f\u51fa"] = real_estate["\u6708\u7e73\u91d1\u984d"] * 12
     real_estate["\u73fe\u503c\u6263\u672a\u4f86\u623f\u8cb8\u652f\u51fa\u5f8c\u9918\u984d"] = (
         real_estate["\u623f\u7522\u73fe\u503c"] - real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"]
@@ -207,29 +246,21 @@ def build_real_estate_analysis(real_estate_df):
     real_estate["\u672a\u4f86\u623f\u8cb8\u652f\u51fa / \u623f\u7522\u73fe\u503c"] = (
         real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"] / real_estate["\u623f\u7522\u73fe\u503c"]
     ).where(real_estate["\u623f\u7522\u73fe\u503c"] != 0)
-    real_estate["\u5269\u9918\u5e74\u6578"] = real_estate["\u5269\u9918\u671f\u6578"] / 12
+    real_estate["\u5269\u9918\u5e74\u6578"] = real_estate["\u81ea\u52d5\u8a08\u7b97\u5269\u9918\u671f\u6578"] / 12
     real_estate["\u539f\u59cb\u8cb8\u6b3e\u6bd4"] = (
         real_estate["\u8cb8\u6b3e\u7e3d\u984d"] / real_estate["\u623f\u7522\u73fe\u503c"]
     ).where(real_estate["\u623f\u7522\u73fe\u503c"] != 0)
     return real_estate
 
 
-def add_real_estate_appreciation_scenario(real_estate, annual_appreciation_rate):
-    scenario = real_estate.copy()
-    scenario["\u5269\u9918\u5e74\u6578"] = scenario["\u5269\u9918\u671f\u6578"] / 12
-    scenario["\u5047\u8a2d\u589e\u503c\u5f8c\u623f\u7522\u4f30\u503c"] = scenario["\u623f\u7522\u73fe\u503c"] * (
-        (1 + annual_appreciation_rate) ** scenario["\u5269\u9918\u5e74\u6578"]
-    )
-    scenario["\u589e\u503c\u60c5\u5883\u9918\u984d"] = (
-        scenario["\u5047\u8a2d\u589e\u503c\u5f8c\u623f\u7522\u4f30\u503c"] - scenario["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"]
-    )
-    return scenario
-
-
 def empty_real_estate_analysis():
     return pd.DataFrame(
-        columns=REAL_ESTATE_REQUIRED_COLUMNS
+        columns=REAL_ESTATE_BASE_REQUIRED_COLUMNS
+        + REAL_ESTATE_NEW_SCHEDULE_COLUMNS
         + [
+            "\u7e3d\u671f\u6578",
+            "\u5df2\u904e\u671f\u6578",
+            "\u81ea\u52d5\u8a08\u7b97\u5269\u9918\u671f\u6578",
             "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
             "\u6bcf\u5e74\u623f\u8cb8\u652f\u51fa",
             "\u73fe\u503c\u6263\u672a\u4f86\u623f\u8cb8\u652f\u51fa\u5f8c\u9918\u984d",
@@ -952,13 +983,17 @@ def build_display_real_estate(real_estate):
     ]:
         display[column] = display[column].apply(format_currency)
     display["\u5269\u9918\u5e74\u6578"] = display["\u5269\u9918\u5e74\u6578"].apply(format_price)
+    display["\u5e74\u5229\u7387"] = display["\u5e74\u5229\u7387"].apply(format_interest_rate)
     return display[
         [
             "\u8cc7\u7522\u540d\u7a31",
             "\u985e\u578b",
             "\u623f\u7522\u73fe\u503c",
             "\u6708\u7e73\u91d1\u984d",
-            "\u5269\u9918\u671f\u6578",
+            "\u5e74\u5229\u7387",
+            "\u8cb8\u6b3e\u8d77\u59cb\u65e5\u671f",
+            "\u8cb8\u6b3e\u5e74\u9650",
+            "\u81ea\u52d5\u8a08\u7b97\u5269\u9918\u671f\u6578",
             "\u5269\u9918\u5e74\u6578",
             "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
             "\u5099\u8a3b",
@@ -1200,12 +1235,24 @@ holdings_df = add_price_analysis(holdings_df, cash)
 real_estate_raw_df, real_estate_error = read_real_estate_csv()
 real_estate_status_message = None
 if real_estate_raw_df is not None:
-    missing_real_estate_columns = [
-        column for column in REAL_ESTATE_REQUIRED_COLUMNS if column not in real_estate_raw_df.columns
+    missing_real_estate_base_columns = [
+        column for column in REAL_ESTATE_BASE_REQUIRED_COLUMNS if column not in real_estate_raw_df.columns
     ]
-    if missing_real_estate_columns:
+    has_new_real_estate_schedule = all(
+        column in real_estate_raw_df.columns for column in REAL_ESTATE_NEW_SCHEDULE_COLUMNS
+    )
+    has_old_real_estate_schedule = all(
+        column in real_estate_raw_df.columns for column in REAL_ESTATE_OLD_SCHEDULE_COLUMNS
+    )
+    if missing_real_estate_base_columns:
         real_estate_df = empty_real_estate_analysis()
-        real_estate_status_message = "不動產資料讀取失敗：缺少必要欄位：" + "、".join(missing_real_estate_columns)
+        real_estate_status_message = "不動產資料讀取失敗：缺少必要欄位：" + "、".join(missing_real_estate_base_columns)
+    elif not has_new_real_estate_schedule and not has_old_real_estate_schedule:
+        real_estate_df = empty_real_estate_analysis()
+        real_estate_status_message = (
+            "不動產資料讀取失敗：請提供「貸款起始日期」與「貸款年限」，"
+            "或保留舊欄位「剩餘期數」作為備援。"
+        )
     else:
         real_estate_df = build_real_estate_analysis(real_estate_raw_df)
 else:
@@ -1262,7 +1309,7 @@ else:
     st.success("現金已達 12 個月房貸安全水位。")
 
 st.caption(
-    "未來房貸總支出 = 月繳金額 × 剩餘期數，包含未來利息，不等於銀行貸款本金餘額。"
+    "未來房貸總支出 = 月繳金額 × 自動計算剩餘期數，包含未來利息，不等於銀行貸款本金餘額。"
     "主要用來評估現金流壓力，不代表銀行實際貸款本金餘額。"
 )
 
@@ -1279,8 +1326,12 @@ overview_row_2[2].metric("預估實際損益", format_currency(total_estimated_p
 
 st.header("不動產與貸款狀況")
 st.caption(
-    "未來房貸總支出 = 月繳金額 × 剩餘期數，包含未來利息，不等於銀行貸款本金餘額。"
+    "未來房貸總支出 = 月繳金額 × 自動計算剩餘期數，包含未來利息，不等於銀行貸款本金餘額。"
     "主要用來評估現金流壓力，不代表銀行實際貸款本金餘額。"
+)
+st.caption(
+    "剩餘期數由貸款起始日期與貸款年限自動估算，"
+    "實際仍可能因提前還款、寬限期、利率調整而與銀行資料不同。"
 )
 if real_estate_status_message:
     st.error(real_estate_status_message)
