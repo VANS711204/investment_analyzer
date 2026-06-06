@@ -16,6 +16,7 @@ except ImportError:
 
 
 HOLDINGS_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuANiIaqPgsy_-PF16-evKIwSsKluYMacgQG9zVtQ4hlxRrl3_s_6SWzSOkD4pOtA4GD3sb9af9TAn/pub?gid=0&single=true&output=csv"
+REAL_ESTATE_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTuANiIaqPgsy_-PF16-evKIwSsKluYMacgQG9zVtQ4hlxRrl3_s_6SWzSOkD4pOtA4GD3sb9af9TAn/pub?gid=1303969979&single=true&output=csv"
 SETTINGS_FILE = Path(__file__).with_name("settings.json")
 CSV_CACHE_FILE = Path(__file__).with_name("last_successful_transactions.csv")
 YFINANCE_CACHE_DIR = Path(__file__).with_name(".yfinance_cache")
@@ -49,6 +50,25 @@ NUMERIC_COLUMNS = [
     "\u4ea4\u6613\u7a05",
 ]
 
+REAL_ESTATE_REQUIRED_COLUMNS = [
+    "\u8cc7\u7522\u540d\u7a31",
+    "\u985e\u578b",
+    "\u623f\u7522\u73fe\u503c",
+    "\u8cb8\u6b3e\u7e3d\u984d",
+    "\u6708\u7e73\u91d1\u984d",
+    "\u5e74\u5229\u7387",
+    "\u5269\u9918\u671f\u6578",
+    "\u5099\u8a3b",
+]
+
+REAL_ESTATE_NUMERIC_COLUMNS = [
+    "\u623f\u7522\u73fe\u503c",
+    "\u8cb8\u6b3e\u7e3d\u984d",
+    "\u6708\u7e73\u91d1\u984d",
+    "\u5e74\u5229\u7387",
+    "\u5269\u9918\u671f\u6578",
+]
+
 EXCLUDED_TRANSACTION_KEYWORDS = [
     "\u73fe\u8cb7\u80a1\u606f",
     "\u80a1\u606f",
@@ -67,6 +87,9 @@ ETF_CONCENTRATION_WARNING_THRESHOLD = 0.30
 ETF_NO_ADD_THRESHOLD = 0.35
 CASH_LOW_THRESHOLD = 0.20
 CASH_CRITICAL_THRESHOLD = 0.10
+REAL_ESTATE_LOAN_PRESSURE_THRESHOLD = 0.70
+MONTHLY_MORTGAGE_WARNING_AMOUNT = 80000
+REAL_ESTATE_CONCENTRATION_THRESHOLD = 0.60
 ETF_TYPE_KEYWORDS = ["ETF", "\u53f0\u706350", "\u9ad8\u606f", "\u9ad8\u80a1\u606f", "\u7f8e\u50b5", "\u50b5", "\u516c\u53f8\u50b5"]
 ETF_TYPE_CODES = {"0050", "00679B", "00687B", "00919", "00929", "00878", "00885"}
 SHARES_PER_LOT = 1000
@@ -74,7 +97,10 @@ SHARES_PER_LOT = 1000
 
 def parse_number(series):
     return pd.to_numeric(
-        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.strip(),
         errors="coerce",
     ).fillna(0)
 
@@ -153,6 +179,65 @@ def read_holdings_csv(url):
         errors.append(f"curl.exe: {exc}")
 
     return None, "；".join(errors)
+
+
+def read_real_estate_csv():
+    try:
+        return pd.read_csv(REAL_ESTATE_CSV_URL), None
+    except Exception as exc:
+        pandas_error = str(exc)
+
+    fallback_df, fallback_error = read_holdings_csv(REAL_ESTATE_CSV_URL)
+    if fallback_df is not None:
+        return fallback_df, None
+
+    return None, f"pandas.read_csv: {pandas_error}；備援讀取: {fallback_error}"
+
+
+def build_real_estate_analysis(real_estate_df):
+    real_estate = real_estate_df.copy()
+    for column in REAL_ESTATE_NUMERIC_COLUMNS:
+        real_estate[column] = parse_number(real_estate[column])
+
+    real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"] = real_estate["\u6708\u7e73\u91d1\u984d"] * real_estate["\u5269\u9918\u671f\u6578"]
+    real_estate["\u6bcf\u5e74\u623f\u8cb8\u652f\u51fa"] = real_estate["\u6708\u7e73\u91d1\u984d"] * 12
+    real_estate["\u73fe\u503c\u6263\u672a\u4f86\u623f\u8cb8\u652f\u51fa\u5f8c\u9918\u984d"] = (
+        real_estate["\u623f\u7522\u73fe\u503c"] - real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"]
+    )
+    real_estate["\u672a\u4f86\u623f\u8cb8\u652f\u51fa / \u623f\u7522\u73fe\u503c"] = (
+        real_estate["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"] / real_estate["\u623f\u7522\u73fe\u503c"]
+    ).where(real_estate["\u623f\u7522\u73fe\u503c"] != 0)
+    real_estate["\u5269\u9918\u5e74\u6578"] = real_estate["\u5269\u9918\u671f\u6578"] / 12
+    real_estate["\u539f\u59cb\u8cb8\u6b3e\u6bd4"] = (
+        real_estate["\u8cb8\u6b3e\u7e3d\u984d"] / real_estate["\u623f\u7522\u73fe\u503c"]
+    ).where(real_estate["\u623f\u7522\u73fe\u503c"] != 0)
+    return real_estate
+
+
+def add_real_estate_appreciation_scenario(real_estate, annual_appreciation_rate):
+    scenario = real_estate.copy()
+    scenario["\u5269\u9918\u5e74\u6578"] = scenario["\u5269\u9918\u671f\u6578"] / 12
+    scenario["\u5047\u8a2d\u589e\u503c\u5f8c\u623f\u7522\u4f30\u503c"] = scenario["\u623f\u7522\u73fe\u503c"] * (
+        (1 + annual_appreciation_rate) ** scenario["\u5269\u9918\u5e74\u6578"]
+    )
+    scenario["\u589e\u503c\u60c5\u5883\u9918\u984d"] = (
+        scenario["\u5047\u8a2d\u589e\u503c\u5f8c\u623f\u7522\u4f30\u503c"] - scenario["\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa"]
+    )
+    return scenario
+
+
+def empty_real_estate_analysis():
+    return pd.DataFrame(
+        columns=REAL_ESTATE_REQUIRED_COLUMNS
+        + [
+            "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
+            "\u6bcf\u5e74\u623f\u8cb8\u652f\u51fa",
+            "\u73fe\u503c\u6263\u672a\u4f86\u623f\u8cb8\u652f\u51fa\u5f8c\u9918\u984d",
+            "\u672a\u4f86\u623f\u8cb8\u652f\u51fa / \u623f\u7522\u73fe\u503c",
+            "\u5269\u9918\u5e74\u6578",
+            "\u539f\u59cb\u8cb8\u6b3e\u6bd4",
+        ]
+    )
 
 
 def fetch_twse_stock_info(stock_id):
@@ -596,6 +681,38 @@ def format_percent(value):
     return f"{value:.2%}"
 
 
+def format_months(value):
+    if pd.isna(value):
+        return "\u7121\u6cd5\u53d6\u5f97"
+    return f"{value:,.1f} \u500b\u6708"
+
+
+def format_interest_rate(value):
+    if pd.isna(value):
+        return "\u7121\u6cd5\u53d6\u5f97"
+    rate = value / 100 if value > 1 else value
+    return f"{rate:.2%}"
+
+
+def render_mortgage_cashflow_check(post_cash, monthly_mortgage_total):
+    if not monthly_mortgage_total:
+        return
+
+    buffer_months = post_cash / monthly_mortgage_total
+    if buffer_months < 6:
+        st.error(
+            f"買進後現金緩衝不足 6 個月房貸，不建議執行。"
+            f"目前約可支撐 {buffer_months:.1f} 個月。"
+        )
+    elif buffer_months < 12:
+        st.warning(
+            f"買進後現金緩衝低於 12 個月房貸，建議降低買入金額或分批。"
+            f"目前約可支撐 {buffer_months:.1f} 個月。"
+        )
+    else:
+        st.success(f"買進後仍保有 12 個月以上房貸緩衝，目前約可支撐 {buffer_months:.1f} 個月。")
+
+
 def find_holding(holdings, stock_id):
     matched = holdings[holdings["\u80a1\u7968\u4ee3\u865f"].astype(str).eq(str(stock_id).strip())]
     if matched.empty:
@@ -826,7 +943,69 @@ def build_display_holdings(holdings):
     ]
 
 
-def build_today_conclusions(holdings, total_assets, cash_ratio, overall_return):
+def build_display_real_estate(real_estate):
+    display = real_estate.copy()
+    for column in [
+        "\u623f\u7522\u73fe\u503c",
+        "\u6708\u7e73\u91d1\u984d",
+        "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
+    ]:
+        display[column] = display[column].apply(format_currency)
+    display["\u5269\u9918\u5e74\u6578"] = display["\u5269\u9918\u5e74\u6578"].apply(format_price)
+    return display[
+        [
+            "\u8cc7\u7522\u540d\u7a31",
+            "\u985e\u578b",
+            "\u623f\u7522\u73fe\u503c",
+            "\u6708\u7e73\u91d1\u984d",
+            "\u5269\u9918\u671f\u6578",
+            "\u5269\u9918\u5e74\u6578",
+            "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
+            "\u5099\u8a3b",
+        ]
+    ]
+
+
+def build_display_advanced_real_estate(real_estate):
+    display = real_estate.copy()
+    for column in [
+        "\u8cb8\u6b3e\u7e3d\u984d",
+        "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
+        "\u623f\u7522\u73fe\u503c",
+        "\u73fe\u503c\u6263\u672a\u4f86\u623f\u8cb8\u652f\u51fa\u5f8c\u9918\u984d",
+    ]:
+        display[column] = display[column].apply(format_currency)
+    display["\u5e74\u5229\u7387"] = display["\u5e74\u5229\u7387"].apply(format_interest_rate)
+    display["\u672a\u4f86\u623f\u8cb8\u652f\u51fa / \u623f\u7522\u73fe\u503c"] = display[
+        "\u672a\u4f86\u623f\u8cb8\u652f\u51fa / \u623f\u7522\u73fe\u503c"
+    ].apply(format_percent)
+    display["\u539f\u59cb\u8cb8\u6b3e\u6bd4"] = display["\u539f\u59cb\u8cb8\u6b3e\u6bd4"].apply(format_percent)
+    return display[
+        [
+            "\u8cc7\u7522\u540d\u7a31",
+            "\u8cb8\u6b3e\u7e3d\u984d",
+            "\u5e74\u5229\u7387",
+            "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa",
+            "\u672a\u4f86\u623f\u8cb8\u652f\u51fa / \u623f\u7522\u73fe\u503c",
+            "\u539f\u59cb\u8cb8\u6b3e\u6bd4",
+            "\u623f\u7522\u73fe\u503c",
+            "\u73fe\u503c\u6263\u672a\u4f86\u623f\u8cb8\u652f\u51fa\u5f8c\u9918\u984d",
+        ]
+    ]
+
+
+def build_real_estate_summary_table(real_estate_value_total, future_mortgage_payment_total):
+    return pd.DataFrame(
+        [
+            {
+                "\u623f\u7522\u73fe\u503c\u5408\u8a08": format_currency(real_estate_value_total),
+                "\u672a\u4f86\u623f\u8cb8\u7e3d\u652f\u51fa\u5408\u8a08": format_currency(future_mortgage_payment_total),
+            }
+        ]
+    )
+
+
+def build_today_conclusions(holdings, total_assets, cash_ratio, overall_return, real_estate_summary):
     conclusions = []
 
     if total_assets and cash_ratio < CASH_CRITICAL_THRESHOLD:
@@ -862,6 +1041,25 @@ def build_today_conclusions(holdings, total_assets, cash_ratio, overall_return):
 
     if total_assets and overall_return > 0 and cash_ratio >= CASH_LOW_THRESHOLD:
         conclusions.append(("success", "整體帳面報酬率為正，且現金水位仍有餘裕，可依原本計畫分批布局。"))
+
+    monthly_mortgage_total = real_estate_summary["monthly_mortgage_total"]
+    mortgage_buffer_months = real_estate_summary["mortgage_buffer_months"]
+    stock_cash_total = real_estate_summary["stock_cash_total"]
+    mortgage_safety_level_12m = real_estate_summary["mortgage_safety_level_12m"]
+
+    if not pd.isna(mortgage_buffer_months):
+        if mortgage_buffer_months < 6:
+            conclusions.append(("error", "現金緩衝偏低，建議先提高現金水位，不宜積極加碼投資。"))
+        elif mortgage_buffer_months <= 12:
+            conclusions.append(("warning", "現金緩衝尚可，但投資加碼建議分批，避免壓縮房貸現金流。"))
+        else:
+            conclusions.append(("success", "現金緩衝相對充足，可依投資計畫分批布局。"))
+
+    if monthly_mortgage_total > MONTHLY_MORTGAGE_WARNING_AMOUNT:
+        conclusions.append(("warning", "每月房貸支出較高，需優先確保穩定現金流。"))
+
+    if mortgage_safety_level_12m and stock_cash_total < mortgage_safety_level_12m:
+        conclusions.append(("warning", "短期流動性偏緊，建議降低高風險投資加碼。"))
 
     if not conclusions:
         conclusions.append(("info", "目前沒有明顯集中或現金水位警訊，可以先維持觀察並按計畫調整。"))
@@ -999,6 +1197,21 @@ excluded_transactions_df = working_df[working_df["交易分類"] == "未納入"]
 holdings_df = build_holdings(included_transactions_df)
 holdings_df = add_price_analysis(holdings_df, cash)
 
+real_estate_raw_df, real_estate_error = read_real_estate_csv()
+real_estate_status_message = None
+if real_estate_raw_df is not None:
+    missing_real_estate_columns = [
+        column for column in REAL_ESTATE_REQUIRED_COLUMNS if column not in real_estate_raw_df.columns
+    ]
+    if missing_real_estate_columns:
+        real_estate_df = empty_real_estate_analysis()
+        real_estate_status_message = "不動產資料讀取失敗：缺少必要欄位：" + "、".join(missing_real_estate_columns)
+    else:
+        real_estate_df = build_real_estate_analysis(real_estate_raw_df)
+else:
+    real_estate_df = empty_real_estate_analysis()
+    real_estate_status_message = "不動產資料讀取失敗：" + str(real_estate_error)
+
 stock_market_value = holdings_df["目前市值"].sum(skipna=True)
 total_cost = holdings_df["總投入成本"].sum()
 total_unrealized_profit = holdings_df["未實現損益"].sum(skipna=True)
@@ -1008,9 +1221,54 @@ estimated_return = total_estimated_profit / total_cost if total_cost else 0
 total_assets = stock_market_value + cash
 cash_ratio = cash / total_assets if total_assets else 0
 
-st.header("投資總覽")
+real_estate_value_total = real_estate_df["房產現值"].sum() if not real_estate_df.empty else 0
+future_mortgage_payment_total = real_estate_df["未來房貸總支出"].sum() if not real_estate_df.empty else 0
+monthly_mortgage_total = real_estate_df["月繳金額"].sum() if not real_estate_df.empty else 0
+yearly_mortgage_total = real_estate_df["每年房貸支出"].sum() if not real_estate_df.empty else 0
+conservative_balance_total = (
+    real_estate_df["現值扣未來房貸支出後餘額"].sum() if not real_estate_df.empty else 0
+)
+overall_asset_total = stock_market_value + cash + real_estate_value_total
+estimated_net_assets = overall_asset_total - future_mortgage_payment_total
+overall_loan_pressure_ratio = (
+    future_mortgage_payment_total / real_estate_value_total if real_estate_value_total else pd.NA
+)
+real_estate_asset_ratio = real_estate_value_total / overall_asset_total if overall_asset_total else pd.NA
+stock_cash_total = stock_market_value + cash
+mortgage_buffer_months = cash / monthly_mortgage_total if monthly_mortgage_total else pd.NA
+mortgage_safety_level_12m = monthly_mortgage_total * 12
+cash_gap_to_12m_mortgage = mortgage_safety_level_12m - cash
+
+st.header("現金流與資產總覽")
+overall_row_1 = st.columns(4)
+overall_row_1[0].metric("股票市值", format_currency(stock_market_value))
+overall_row_1[1].metric("現金", format_currency(cash))
+overall_row_1[2].metric("房產現值合計", format_currency(real_estate_value_total))
+overall_row_1[3].metric("總資產", format_currency(overall_asset_total))
+
+overall_row_2 = st.columns(4)
+overall_row_2[0].metric("每月房貸支出合計", format_currency(monthly_mortgage_total))
+overall_row_2[1].metric("每年房貸支出合計", format_currency(yearly_mortgage_total))
+overall_row_2[2].metric("股票現金合計", format_currency(stock_cash_total))
+overall_row_2[3].metric("現金可支撐房貸月數", format_months(mortgage_buffer_months))
+
+cashflow_row_3 = st.columns(2)
+cashflow_row_3[0].metric("12 個月房貸安全水位", format_currency(mortgage_safety_level_12m))
+cashflow_row_3[1].metric("現金缺口", format_currency(max(cash_gap_to_12m_mortgage, 0)))
+
+if cash_gap_to_12m_mortgage > 0:
+    st.warning(f"距離 12 個月房貸安全水位仍差 {format_currency(cash_gap_to_12m_mortgage)} 元。")
+else:
+    st.success("現金已達 12 個月房貸安全水位。")
+
+st.caption(
+    "未來房貸總支出 = 月繳金額 × 剩餘期數，包含未來利息，不等於銀行貸款本金餘額。"
+    "主要用來評估現金流壓力，不代表銀行實際貸款本金餘額。"
+)
+
+st.header("投資資產總覽")
 overview_row_1 = st.columns(3)
-overview_row_1[0].metric("總資產", format_currency(total_assets))
+overview_row_1[0].metric("股票與現金合計", format_currency(total_assets))
 overview_row_1[1].metric("股票總市值", format_currency(stock_market_value))
 overview_row_1[2].metric("現金", format_currency(cash))
 
@@ -1019,8 +1277,34 @@ overview_row_2[0].metric("帳面損益", format_currency(total_unrealized_profit
 overview_row_2[1].metric("整體帳面報酬率", format_percent(overall_return))
 overview_row_2[2].metric("預估實際損益", format_currency(total_estimated_profit))
 
+st.header("不動產與貸款狀況")
+st.caption(
+    "未來房貸總支出 = 月繳金額 × 剩餘期數，包含未來利息，不等於銀行貸款本金餘額。"
+    "主要用來評估現金流壓力，不代表銀行實際貸款本金餘額。"
+)
+if real_estate_status_message:
+    st.error(real_estate_status_message)
+else:
+    st.dataframe(build_display_real_estate(real_estate_df), use_container_width=True)
+    with st.expander("進階不動產估算資料"):
+        st.dataframe(build_display_advanced_real_estate(real_estate_df), use_container_width=True)
+        st.table(build_real_estate_summary_table(real_estate_value_total, future_mortgage_payment_total))
+
+real_estate_summary = {
+    "monthly_mortgage_total": monthly_mortgage_total,
+    "mortgage_buffer_months": mortgage_buffer_months,
+    "stock_cash_total": stock_cash_total,
+    "mortgage_safety_level_12m": mortgage_safety_level_12m,
+}
+
 st.header("今日重點結論")
-for level, message in build_today_conclusions(holdings_df, total_assets, cash_ratio, overall_return):
+for level, message in build_today_conclusions(
+    holdings_df,
+    total_assets,
+    cash_ratio,
+    overall_return,
+    real_estate_summary,
+):
     if level == "error":
         st.error(message)
     elif level == "warning":
@@ -1135,6 +1419,8 @@ if simulation_stock_id:
                 simulation_metrics[4].metric("模擬後總資產", format_currency(simulated_total_assets))
 
                 st.info(plain_result)
+                if simulation_action == "買進":
+                    render_mortgage_cashflow_check(simulated_cash, monthly_mortgage_total)
 
                 no_add_rows = simulated_holdings[
                     (
@@ -1219,6 +1505,7 @@ if simulation_stock_id:
                     st.warning(analysis["建議"] + "：" + analysis["建議理由"])
                 else:
                     st.info(analysis["建議"] + "：" + analysis["建議理由"])
+                render_mortgage_cashflow_check(analysis["買入後現金"], monthly_mortgage_total)
 
 st.header("需要注意的標的")
 watchlist_df = build_watchlist(holdings_df)
