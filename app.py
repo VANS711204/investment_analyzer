@@ -100,7 +100,38 @@ REAL_ESTATE_LOAN_PRESSURE_THRESHOLD = 0.70
 MONTHLY_MORTGAGE_WARNING_AMOUNT = 80000
 REAL_ESTATE_CONCENTRATION_THRESHOLD = 0.60
 ETF_TYPE_KEYWORDS = ["ETF", "\u53f0\u706350", "\u9ad8\u606f", "\u9ad8\u80a1\u606f", "\u7f8e\u50b5", "\u50b5", "\u516c\u53f8\u50b5"]
-ETF_TYPE_CODES = {"0050", "00679B", "00687B", "00919", "00929", "00878", "00885"}
+ETF_TYPE_CODES = {"0050", "00679B", "00687B", "00919", "00929", "00878", "00885", "00830", "006208", "00881", "00927"}
+STOCK_ALIASES = {
+    "群創": "3481",
+    "群創光電": "3481",
+    "聯電": "2303",
+    "聯華電子": "2303",
+    "台積電": "2330",
+    "台積": "2330",
+    "中華": "2204",
+    "中華車": "2204",
+    "元大台灣50": "0050",
+    "台灣50": "0050",
+    "群益台灣精選高息": "00919",
+    "群益高息": "00919",
+    "國泰費城半導體": "00830",
+    "費半": "00830",
+}
+BOND_THEME_CODES = {"00679B", "00687B"}
+BROAD_MARKET_ETF_CODES = {"0050", "006208", "00850", "00922"}
+SEMICONDUCTOR_ETF_CODES = {"00830", "00881", "00927"}
+AI_ELECTRONICS_CODES = {
+    "0050",
+    "00830",
+    "00881",
+    "00927",
+    "2303",
+    "2330",
+    "3481",
+    "2204",
+}
+AI_ELECTRONICS_KEYWORDS = ["半導體", "電子", "AI", "晶片", "台積", "聯電", "群創", "費城半導體"]
+DEFENSIVE_KEYWORDS = ["高息", "高股息", "債", "美債", "公司債"]
 SHARES_PER_LOT = 1000
 
 
@@ -532,6 +563,52 @@ def build_sparkline_svg(prices, positive=True):
     """
 
 
+@st.cache_data(ttl=900)
+def get_finmind_quote(stock_id):
+    stock_id = str(stock_id).strip().upper()
+    start_date = (pd.Timestamp.today().normalize() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    finmind_url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockPrice",
+        "data_id": stock_id,
+        "start_date": start_date,
+    }
+
+    for request_getter in ["requests", "curl_cffi"]:
+        try:
+            if request_getter == "requests":
+                session = requests.Session()
+                session.trust_env = False
+                response = session.get(finmind_url, params=params, timeout=CSV_READ_TIMEOUT_SECONDS)
+            else:
+                from curl_cffi import requests as curl_requests
+
+                response = curl_requests.get(
+                    finmind_url,
+                    params=params,
+                    timeout=CSV_READ_TIMEOUT_SECONDS,
+                    impersonate="chrome",
+                )
+
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") or []
+            if not data:
+                continue
+            rows = sorted(data, key=lambda item: item.get("date", ""))
+            latest = rows[-1]
+            close_price = latest.get("close")
+            if close_price and float(close_price) > 0:
+                return {
+                    "price": float(close_price),
+                    "date": latest.get("date", ""),
+                    "volume": latest.get("Trading_Volume"),
+                }
+        except Exception:
+            continue
+    return None
+
+
 @st.cache_data(ttl=300)
 def get_market_quote(stock_id):
     stock_id = str(stock_id).strip().upper()
@@ -578,6 +655,16 @@ def get_market_quote(stock_id):
         return quote
 
     if yf is None:
+        finmind_quote = get_finmind_quote(stock_id)
+        if finmind_quote:
+            quote.update(
+                {
+                    "price": finmind_quote["price"],
+                    "source": "FinMind 最近收盤價",
+                    "is_fallback": True,
+                    "message": "即時行情暫時不可用，已使用 FinMind 最近收盤價。",
+                }
+            )
         return quote
 
     for suffix in [".TW", ".TWO"]:
@@ -635,6 +722,18 @@ def get_market_quote(stock_id):
                         }
                     )
                     return quote
+
+    finmind_quote = get_finmind_quote(stock_id)
+    if finmind_quote:
+        quote.update(
+            {
+                "price": finmind_quote["price"],
+                "source": "FinMind 最近收盤價",
+                "is_fallback": True,
+                "message": "即時行情暫時不可用，已使用 FinMind 最近收盤價。",
+            }
+        )
+        return quote
 
     return quote
 
@@ -941,9 +1040,13 @@ def safe_float(value, default=0.0):
 
 def extract_stock_from_question(question, holdings):
     question = str(question).strip().upper()
-    code_match = re.search(r"\b\d{4,6}[A-Z]?\b", question)
+    code_match = re.search(r"(?<![A-Z0-9])(\d{4,6}[A-Z]?)(?![A-Z0-9])", question)
     if code_match:
-        return code_match.group(0)
+        return code_match.group(1)
+
+    for alias, stock_id in STOCK_ALIASES.items():
+        if alias.upper() in question:
+            return stock_id
 
     if holdings.empty:
         return ""
@@ -961,6 +1064,8 @@ def detect_question_intent(question):
     text = str(question)
     if any(keyword in text for keyword in ["賣", "減碼", "停損", "出場"]):
         return "sell"
+    if any(keyword in text for keyword in ["適合我", "適合", "可以嗎"]):
+        return "fit"
     if any(keyword in text for keyword in ["加碼", "買", "進場", "佈局", "布局"]):
         return "buy"
     if any(keyword in text for keyword in ["大跌", "崩", "下跌", "怎麼辦", "恐慌", "殺盤"]):
@@ -971,6 +1076,537 @@ def detect_question_intent(question):
 def append_unique(items, item):
     if item and item not in items:
         items.append(item)
+
+
+def clamp(value, minimum=0, maximum=100):
+    return max(minimum, min(maximum, value))
+
+
+def normalize_ratio(value):
+    if pd.isna(value):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def classify_stock_theme(stock_id, stock_name, asset_type=None):
+    stock_id = str(stock_id).strip().upper()
+    stock_name = str(stock_name).strip()
+    text = f"{stock_id} {stock_name}".upper()
+
+    if stock_id in BOND_THEME_CODES or "債" in stock_name:
+        return {"theme": "bond", "label": "債券/防守", "is_ai_electronics": False, "is_defensive": True}
+    if stock_id in SEMICONDUCTOR_ETF_CODES or any(keyword.upper() in text for keyword in ["費半", "半導體", "晶片"]):
+        return {"theme": "semiconductor", "label": "半導體/AI", "is_ai_electronics": True, "is_defensive": False}
+    if stock_id in AI_ELECTRONICS_CODES or any(keyword.upper() in text for keyword in AI_ELECTRONICS_KEYWORDS):
+        return {"theme": "electronics", "label": "電子/AI", "is_ai_electronics": True, "is_defensive": False}
+    if stock_id in BROAD_MARKET_ETF_CODES or "台灣50" in stock_name:
+        return {"theme": "broad_market", "label": "台股大盤型", "is_ai_electronics": True, "is_defensive": False}
+    if any(keyword in stock_name for keyword in DEFENSIVE_KEYWORDS) or asset_type == "ETF / 債券 ETF":
+        return {"theme": "defensive", "label": "收益/防守", "is_ai_electronics": False, "is_defensive": True}
+    return {"theme": "single_stock", "label": "個股", "is_ai_electronics": False, "is_defensive": False}
+
+
+@st.cache_data(ttl=900)
+def get_yahoo_chart_snapshot(stock_id, period="1y", interval="1d"):
+    stock_id = str(stock_id).strip().upper()
+    symbol_candidates = [stock_id] if stock_id.startswith("^") or "=" in stock_id else [f"{stock_id}.TW", f"{stock_id}.TWO"]
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for ticker_symbol in symbol_candidates:
+        yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}"
+        params = {"range": period, "interval": interval}
+
+        for request_getter in ["requests", "curl_cffi"]:
+            try:
+                if request_getter == "requests":
+                    session = requests.Session()
+                    session.trust_env = False
+                    response = session.get(yahoo_url, params=params, headers=headers, timeout=CSV_READ_TIMEOUT_SECONDS)
+                else:
+                    from curl_cffi import requests as curl_requests
+
+                    response = curl_requests.get(
+                        yahoo_url,
+                        params=params,
+                        headers=headers,
+                        timeout=CSV_READ_TIMEOUT_SECONDS,
+                        impersonate="chrome",
+                    )
+
+                response.raise_for_status()
+                result = response.json().get("chart", {}).get("result") or []
+                if not result:
+                    continue
+
+                quote_data = (result[0].get("indicators", {}).get("quote") or [{}])[0]
+                closes = [float(value) for value in quote_data.get("close") or [] if value and float(value) > 0]
+                volumes = [float(value) for value in quote_data.get("volume") or [] if value is not None]
+                meta = result[0].get("meta", {}) or {}
+                if len(closes) >= 2:
+                    return {"symbol": ticker_symbol, "closes": closes, "volumes": volumes, "meta": meta}
+            except Exception:
+                continue
+
+    return {"symbol": "", "closes": [], "volumes": [], "meta": {}}
+
+
+@st.cache_data(ttl=3600)
+def get_yahoo_valuation_snapshot(stock_id):
+    if yf is None:
+        return {"pe": None}
+
+    stock_id = str(stock_id).strip().upper()
+    for suffix in [".TW", ".TWO"]:
+        try:
+            try:
+                from curl_cffi import requests as curl_requests
+
+                session = curl_requests.Session(impersonate="chrome")
+                session.trust_env = False
+                ticker = yf.Ticker(f"{stock_id}{suffix}", session=session)
+            except Exception:
+                ticker = yf.Ticker(f"{stock_id}{suffix}")
+
+            info = ticker.info or {}
+            pe = info.get("trailingPE") or info.get("forwardPE")
+            return {"pe": float(pe) if pe else None}
+        except Exception:
+            continue
+    return {"pe": None}
+
+
+def summarize_chart_snapshot(chart_snapshot):
+    closes = chart_snapshot.get("closes") or []
+    volumes = chart_snapshot.get("volumes") or []
+    if len(closes) < 2:
+        return {
+            "change_30d": None,
+            "year_line_distance": None,
+            "volume_ratio": None,
+            "heat_label": "行情資料不足",
+            "volume_label": "量能資料不足",
+            "trend_label": "趨勢資料不足",
+        }
+
+    latest = closes[-1]
+    base_30 = closes[-31] if len(closes) >= 31 else closes[0]
+    change_30d = latest / base_30 - 1 if base_30 else None
+    year_values = closes[-200:] if len(closes) >= 60 else closes
+    year_average = sum(year_values) / len(year_values)
+    year_line_distance = latest / year_average - 1 if year_average else None
+
+    volume_ratio = None
+    if len(volumes) >= 21:
+        recent_volume = volumes[-1]
+        average_volume = sum(volumes[-21:-1]) / 20
+        if average_volume:
+            volume_ratio = recent_volume / average_volume
+
+    if change_30d is None:
+        heat_label = "近期方向不明"
+    elif change_30d >= 0.12:
+        heat_label = "近期偏熱"
+    elif change_30d <= -0.10:
+        heat_label = "近期偏弱"
+    else:
+        heat_label = "近期平穩"
+
+    if year_line_distance is None:
+        trend_label = "趨勢資料不足"
+    elif year_line_distance >= 0.12:
+        trend_label = "價格站在長期均線上方，追價要保守"
+    elif year_line_distance <= -0.12:
+        trend_label = "價格低於長期平均，適合先觀察是否止穩"
+    else:
+        trend_label = "價格接近長期平均"
+
+    if volume_ratio is None:
+        volume_label = "量能資料不足"
+    elif volume_ratio >= 1.8:
+        volume_label = "成交量明顯放大，短線波動可能較高"
+    elif volume_ratio <= 0.6:
+        volume_label = "成交量偏低，買賣要更分批"
+    else:
+        volume_label = "成交量大致正常"
+
+    return {
+        "change_30d": change_30d,
+        "year_line_distance": year_line_distance,
+        "volume_ratio": volume_ratio,
+        "heat_label": heat_label,
+        "volume_label": volume_label,
+        "trend_label": trend_label,
+    }
+
+
+def summarize_valuation(valuation_snapshot, asset_type):
+    pe = valuation_snapshot.get("pe")
+    if asset_type == "ETF / 債券 ETF":
+        return "ETF 不以單一本益比判斷，重點看配置是否重複"
+    if pe is None or pd.isna(pe):
+        return "估值資料不足，先不要只靠價格判斷"
+    if pe >= 28:
+        return "估值偏高，較不適合追價"
+    if pe <= 12:
+        return "估值不算貴，但仍要看配置與現金"
+    return "估值大致中性"
+
+
+def build_user_risk_profile(holdings, cash, stock_market_value, overall_asset_total, monthly_mortgage_total, mortgage_buffer_months):
+    cash_buffer_months = None if pd.isna(mortgage_buffer_months) else float(mortgage_buffer_months)
+    stock_exposure_ratio = stock_market_value / overall_asset_total if overall_asset_total else 0
+    cash_ratio = cash / overall_asset_total if overall_asset_total else 0
+    max_single_ratio = 0.0
+    max_single_name = ""
+    electronics_ratio = 0.0
+
+    if not holdings.empty:
+        ratio_column = "\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b"
+        if ratio_column in holdings.columns:
+            sorted_holdings = holdings.dropna(subset=[ratio_column]).sort_values(ratio_column, ascending=False)
+            if not sorted_holdings.empty:
+                top_row = sorted_holdings.iloc[0]
+                max_single_ratio = normalize_ratio(top_row[ratio_column])
+                max_single_name = f"{top_row['\u80a1\u7968\u4ee3\u865f']} {top_row['\u80a1\u7968\u540d\u7a31']}"
+
+            for _, row in holdings.iterrows():
+                theme = classify_stock_theme(row["\u80a1\u7968\u4ee3\u865f"], row["\u80a1\u7968\u540d\u7a31"], row.get("\u985e\u578b"))
+                if theme["is_ai_electronics"]:
+                    electronics_ratio += normalize_ratio(row.get(ratio_column, 0))
+
+    conservative_mode = (
+        stock_exposure_ratio > 0.75
+        or max_single_ratio > 0.15
+        or electronics_ratio > 0.50
+        or (cash_buffer_months is not None and cash_buffer_months < 6)
+    )
+
+    notes = []
+    if cash_buffer_months is not None and cash_buffer_months < 6:
+        notes.append(f"現金可支撐 {format_months(cash_buffer_months)} 房貸，先偏保守。")
+    if stock_exposure_ratio > 0.75:
+        notes.append(f"股票總曝險約 {format_percent(stock_exposure_ratio)}，新增買進要更小筆。")
+    if max_single_ratio > 0.15:
+        notes.append(f"{max_single_name} 占比約 {format_percent(max_single_ratio)}，單一持股偏集中。")
+    if electronics_ratio > 0.50:
+        notes.append(f"電子/AI 相關曝險約 {format_percent(electronics_ratio)}，同類標的不要一次加太多。")
+    if not notes:
+        notes.append("現金、曝險與集中度目前沒有明顯失衡。")
+
+    return {
+        "cash_buffer_months": cash_buffer_months,
+        "stock_exposure_ratio": stock_exposure_ratio,
+        "cash_ratio": cash_ratio,
+        "max_single_ratio": max_single_ratio,
+        "max_single_name": max_single_name,
+        "electronics_ratio": electronics_ratio,
+        "conservative_mode": conservative_mode,
+        "notes": notes,
+    }
+
+
+def build_stock_situation(stock_id, stock_name, asset_type, quote):
+    chart = get_yahoo_chart_snapshot(stock_id)
+    chart_summary = summarize_chart_snapshot(chart)
+    valuation = summarize_valuation(get_yahoo_valuation_snapshot(stock_id), asset_type)
+    theme = classify_stock_theme(stock_id, stock_name, asset_type)
+
+    price = quote.get("price")
+    if price is None and chart.get("closes"):
+        price = chart["closes"][-1]
+
+    if theme["theme"] in ["semiconductor", "electronics"]:
+        market_label = "會跟電子與 AI 題材情緒連動"
+    elif theme["is_defensive"]:
+        market_label = "偏收益或防守型，重點是不要買到配置過重"
+    else:
+        market_label = "主要看個股本身與大盤情緒"
+
+    return {
+        "price": price,
+        "theme": theme,
+        "heat_label": chart_summary["heat_label"],
+        "trend_label": chart_summary["trend_label"],
+        "volume_label": chart_summary["volume_label"],
+        "valuation_label": valuation,
+        "market_label": market_label,
+        "change_30d": chart_summary["change_30d"],
+        "year_line_distance": chart_summary["year_line_distance"],
+        "volume_ratio": chart_summary["volume_ratio"],
+        "data_available": price is not None and not pd.isna(price),
+    }
+
+
+@st.cache_data(ttl=900)
+def get_market_context():
+    market_items = [
+        ("^TWII", "台股大盤"),
+        ("^SOX", "費半指數"),
+        ("TX=F", "台指期"),
+    ]
+    summaries = []
+    for symbol, label in market_items:
+        snapshot = get_yahoo_chart_snapshot(symbol, period="3mo", interval="1d")
+        closes = snapshot.get("closes") or []
+        if len(closes) < 2:
+            summaries.append({"label": label, "state": "資料暫時無法更新", "change": None})
+            continue
+        base = closes[-21] if len(closes) >= 21 else closes[0]
+        change = closes[-1] / base - 1 if base else None
+        if change is None:
+            state = "資料不足"
+        elif change >= 0.06:
+            state = "近期偏熱"
+        elif change <= -0.06:
+            state = "近期偏弱"
+        else:
+            state = "近期平穩"
+        summaries.append({"label": label, "state": state, "change": change})
+    return summaries
+
+
+def has_overlap_with_existing_holdings(target_theme, holdings):
+    if holdings.empty:
+        return False
+    for _, row in holdings.iterrows():
+        theme = classify_stock_theme(row["\u80a1\u7968\u4ee3\u865f"], row["\u80a1\u7968\u540d\u7a31"], row.get("\u985e\u578b"))
+        if target_theme["theme"] == theme["theme"]:
+            return True
+        if target_theme["is_ai_electronics"] and theme["is_ai_electronics"]:
+            return True
+    return False
+
+
+def calculate_suitability_score(user_profile, stock_situation, current_holding, intent, asset_ratio, return_rate):
+    score = 78
+    is_buy_like = intent in ["buy", "fit"]
+    theme = stock_situation["theme"]
+    change_30d = stock_situation.get("change_30d")
+    year_distance = stock_situation.get("year_line_distance")
+    volume_ratio = stock_situation.get("volume_ratio")
+
+    if is_buy_like and user_profile["cash_buffer_months"] is not None and user_profile["cash_buffer_months"] < 6:
+        score -= 18
+    if is_buy_like and user_profile["stock_exposure_ratio"] > 0.75:
+        score -= 14
+    if is_buy_like and user_profile["electronics_ratio"] > 0.50 and theme["is_ai_electronics"]:
+        score -= 12
+    if asset_ratio > 0.15:
+        score -= 16
+    if current_holding is not None and is_buy_like and not pd.isna(return_rate) and return_rate > 0.20:
+        score -= 12
+    if change_30d is not None and change_30d > 0.12 and is_buy_like:
+        score -= 10
+    if year_distance is not None and year_distance > 0.12 and is_buy_like:
+        score -= 8
+    if volume_ratio is not None and volume_ratio > 1.8:
+        score -= 5
+    if theme["is_defensive"] and user_profile["stock_exposure_ratio"] > 0.65:
+        score += 6
+    if current_holding is not None and intent in ["hold", "sell"] and asset_ratio <= 0.15:
+        score += 5
+    return int(clamp(round(score), 0, 100))
+
+
+def pick_decision_conclusion(intent, score, is_held, conservative_mode, asset_ratio, return_rate, stock_situation):
+    is_hot = (stock_situation.get("change_30d") or 0) > 0.12 or (stock_situation.get("year_line_distance") or 0) > 0.12
+
+    if intent == "sell":
+        if is_held and (asset_ratio > 0.15 or (not pd.isna(return_rate) and return_rate < -0.15)):
+            return "建議部分減碼"
+        if is_held:
+            return "建議續抱"
+        return "可觀察等待"
+
+    if intent == "market":
+        return "等待"
+
+    if intent in ["buy", "fit"]:
+        if conservative_mode or score < 55:
+            return "可觀察等待"
+        if is_hot:
+            return "不建議追價"
+        if score >= 75:
+            return "適合分批布局"
+        return "可觀察等待"
+
+    if is_held:
+        if asset_ratio > 0.15 and score < 65:
+            return "建議部分減碼"
+        return "建議續抱"
+    return "可觀察等待"
+
+
+def build_decision_action(conclusion, price, avg_cost, is_held, cash_buffer_months):
+    if price is None or pd.isna(price) or price <= 0:
+        return "行情資料暫時無法更新，先不要下買賣決定。"
+
+    if cash_buffer_months is not None and cash_buffer_months < 6 and conclusion in ["適合分批布局", "不建議追價", "可觀察等待"]:
+        return "先保留現金，至少補到 6 個月房貸以上再考慮新買進。"
+
+    if conclusion == "適合分批布局":
+        return f"小量分批，第一筆不超過可用現金 10%，可等 {format_price(price * 0.97)} 附近再買。"
+    if conclusion == "不建議追價":
+        return f"先等回檔或整理，接近 {format_price(price * 0.95)} 以下再重新評估。"
+    if conclusion == "建議部分減碼":
+        return "先減碼 1/3 或把部位降到總資產 15% 以下，不要一次全出。"
+    if conclusion == "建議續抱":
+        review_price = avg_cost * 0.90 if is_held and avg_cost > 0 else price * 0.92
+        return f"續抱觀察；若跌破 {format_price(review_price)} 或持股占比繼續升高，再檢查是否減碼。"
+    return "等待價格與現金條件同時改善；不要重壓，也不要 All in。"
+
+
+def build_decision_assistant_answer(
+    question,
+    holdings,
+    cash,
+    stock_market_value,
+    overall_asset_total,
+    monthly_mortgage_total,
+    mortgage_buffer_months,
+):
+    question = str(question).strip()
+    stock_id = extract_stock_from_question(question, holdings)
+    intent = detect_question_intent(question)
+    user_profile = build_user_risk_profile(
+        holdings,
+        cash,
+        stock_market_value,
+        overall_asset_total,
+        monthly_mortgage_total,
+        mortgage_buffer_months,
+    )
+
+    if not stock_id:
+        market_context = get_market_context()
+        market_notes = [f"{item['label']}：{item['state']}" for item in market_context if item["state"] != "資料暫時無法更新"]
+        reasons = user_profile["notes"][:2]
+        append_unique(reasons, market_notes[0] if market_notes else "行情資料暫時無法更新。")
+        return {
+            "stock_id": "",
+            "stock_name": "整體市場",
+            "quote": None,
+            "conclusion": "等待",
+            "suitability_score": 62 if user_profile["conservative_mode"] else 72,
+            "score_help": "這是目前資產配置的行動適合度，不是市場漲跌預測。",
+            "reasons": reasons[:3],
+            "action": "先保留現金，不急著加碼；若大盤續跌，分 2 到 3 次小量處理。",
+            "context": {
+                "現金": format_currency(cash),
+                "現金可支應房貸": format_months(user_profile["cash_buffer_months"]),
+                "股票總曝險": format_percent(user_profile["stock_exposure_ratio"]),
+                "電子/AI曝險": format_percent(user_profile["electronics_ratio"]),
+            },
+            "stock_summary": ["未指定標的，先用整體資產與市場狀態判斷。"] + market_notes[:2],
+            "user_summary": user_profile["notes"][:3],
+        }
+
+    quote = get_market_quote(stock_id)
+    current_holding = find_holding(holdings, stock_id)
+    stock_name = str(current_holding["\u80a1\u7968\u540d\u7a31"]) if current_holding is not None else get_stock_name(stock_id) or stock_id
+    asset_type = (
+        str(current_holding["\u985e\u578b"])
+        if current_holding is not None
+        else classify_asset_type(pd.Series({"\u80a1\u7968\u4ee3\u865f": stock_id, "\u80a1\u7968\u540d\u7a31": stock_name}))
+    )
+    stock_situation = build_stock_situation(stock_id, stock_name, asset_type, quote)
+
+    if not stock_situation["data_available"]:
+        return {
+            "stock_id": stock_id,
+            "stock_name": stock_name,
+            "quote": quote,
+            "conclusion": "可觀察等待",
+            "suitability_score": 50,
+            "score_help": "行情資料不足時，適合度只代表保守預設。",
+            "reasons": ["行情資料暫時無法更新。", "沒有可靠價格時，不適合做買賣決策。", user_profile["notes"][0]],
+            "action": "等行情恢復後，再用現價、持倉成本、現金與曝險重新判斷。",
+            "context": {
+                "現金": format_currency(cash),
+                "現金可支應房貸": format_months(user_profile["cash_buffer_months"]),
+                "股票總曝險": format_percent(user_profile["stock_exposure_ratio"]),
+            },
+            "stock_summary": ["行情資料暫時無法更新"],
+            "user_summary": user_profile["notes"][:3],
+        }
+
+    is_held = current_holding is not None
+    price = stock_situation["price"]
+    avg_cost = safe_float(current_holding["\u5e73\u5747\u6210\u672c"]) if is_held else 0
+    market_value = safe_float(current_holding["\u76ee\u524d\u5e02\u503c"]) if is_held else 0
+    unrealized_profit = safe_float(current_holding["\u672a\u5be6\u73fe\u640d\u76ca"]) if is_held else 0
+    return_rate = current_holding["\u5831\u916c\u7387"] if is_held else pd.NA
+    asset_ratio = market_value / overall_asset_total if overall_asset_total and is_held else 0
+    target_theme = stock_situation["theme"]
+    overlap = has_overlap_with_existing_holdings(target_theme, holdings) and not is_held
+
+    score = calculate_suitability_score(user_profile, stock_situation, current_holding, intent, asset_ratio, return_rate)
+    if overlap and intent in ["buy", "fit"]:
+        score = int(clamp(score - 8))
+    conclusion = pick_decision_conclusion(
+        intent,
+        score,
+        is_held,
+        user_profile["conservative_mode"],
+        asset_ratio,
+        return_rate,
+        stock_situation,
+    )
+
+    reasons = []
+    if is_held:
+        append_unique(
+            reasons,
+            f"你已持有，成本 {format_price(avg_cost)}、現價 {format_price(price)}、帳面損益 {format_currency(unrealized_profit)}。",
+        )
+        append_unique(reasons, f"這檔占總資產 {format_percent(asset_ratio)}，股票總曝險 {format_percent(user_profile['stock_exposure_ratio'])}。")
+    else:
+        append_unique(reasons, f"你目前未持有，現價約 {format_price(price)}，新增買進會增加 {target_theme['label']} 曝險。")
+        if overlap:
+            append_unique(reasons, "它和現有持股主題有重疊，新增前要先想清楚是不是需要更多同類部位。")
+
+    append_unique(reasons, f"{stock_situation['heat_label']}，{stock_situation['valuation_label']}。")
+    for note in user_profile["notes"]:
+        append_unique(reasons, note)
+    if quote.get("is_fallback"):
+        append_unique(reasons, quote["message"])
+
+    action = build_decision_action(conclusion, price, avg_cost, is_held, user_profile["cash_buffer_months"])
+    stock_summary = [
+        f"現價約 {format_price(price)}",
+        stock_situation["heat_label"],
+        stock_situation["trend_label"],
+        stock_situation["volume_label"],
+        stock_situation["market_label"],
+    ]
+
+    return {
+        "stock_id": stock_id,
+        "stock_name": stock_name,
+        "quote": quote,
+        "conclusion": conclusion,
+        "suitability_score": score,
+        "score_help": "這是此標的適不適合你目前配置的分數，不是股票好壞分數。",
+        "reasons": reasons[:3],
+        "action": action,
+        "context": {
+            "目前價格": format_price(price),
+            "行情來源": quote.get("source") or "Yahoo/最近收盤",
+            "持有狀態": "已持有" if is_held else "未持有",
+            "平均成本": format_price(avg_cost) if is_held else "未持有",
+            "未實現損益": format_currency(unrealized_profit) if is_held else "未持有",
+            "持股占總資產": format_percent(asset_ratio) if is_held else "未持有",
+            "現金": format_currency(cash),
+            "現金可支應房貸": format_months(user_profile["cash_buffer_months"]),
+            "股票總曝險": format_percent(user_profile["stock_exposure_ratio"]),
+            "電子/AI曝險": format_percent(user_profile["electronics_ratio"]),
+        },
+        "stock_summary": stock_summary[:5],
+        "user_summary": user_profile["notes"][:3],
+    }
 
 
 def build_chat_action_line(conclusion, price, avg_cost, is_held, conservative_mode):
@@ -1007,6 +1643,16 @@ def build_investment_assistant_answer(
     monthly_mortgage_total,
     mortgage_buffer_months,
 ):
+    return build_decision_assistant_answer(
+        question,
+        holdings,
+        cash,
+        stock_market_value,
+        overall_asset_total,
+        monthly_mortgage_total,
+        mortgage_buffer_months,
+    )
+
     question = str(question).strip()
     stock_id = extract_stock_from_question(question, holdings)
     intent = detect_question_intent(question)
@@ -1135,6 +1781,61 @@ def build_investment_assistant_answer(
     }
 
 
+def render_assistant_answer_card(answer, compact=False):
+    target_title = f"{answer.get('stock_name', '')} {answer.get('stock_id', '')}".strip() or "整體市場"
+    score = answer.get("suitability_score")
+    score_html = (
+        f'<div class="score-pill" title="{escape(str(answer.get("score_help", "適合度分數")))}">適合度 {int(score)}/100</div>'
+        if score is not None
+        else ""
+    )
+    reasons_html = "".join(
+        f'<div class="assistant-reason">{escape(str(reason))}</div>'
+        for reason in answer.get("reasons", [])[:3]
+    )
+    stock_summary = answer.get("stock_summary") or []
+    user_summary = answer.get("user_summary") or []
+    summary_items = stock_summary[:3] + user_summary[:3]
+    if compact:
+        summary_items = summary_items[:3]
+    summary_html = "".join(
+        f'<div class="assistant-summary-item">{escape(str(item))}</div>'
+        for item in summary_items
+    )
+    context_items = list((answer.get("context") or {}).items())
+    if compact:
+        context_items = context_items[:4]
+    context_html = "".join(
+        f'<div class="assistant-context-item"><span>{escape(str(key))}</span><strong>{escape(str(value))}</strong></div>'
+        for key, value in context_items
+    )
+
+    st.markdown(
+        f"""
+        <div class="assistant-answer-card">
+            <div class="assistant-answer-title">
+                <h4>{escape(target_title)}</h4>
+                {score_html}
+            </div>
+            <div class="assistant-result-card">
+                <div>
+                    <div class="result-label">結論</div>
+                    <div class="result-conclusion">{escape(str(answer.get('conclusion', '等待')))}</div>
+                </div>
+            </div>
+            <div class="assistant-section-label">原因</div>
+            <div class="assistant-reasons">{reasons_html}</div>
+            <div class="assistant-action">行動：{escape(str(answer.get('action', '先等待資料更新。')))}</div>
+            <div class="assistant-section-label">判斷摘要</div>
+            <div class="assistant-summary-grid">{summary_html}</div>
+            <div class="assistant-section-label">使用資料</div>
+            <div class="assistant-context-grid">{context_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_investment_assistant_answer(answer):
     quote = answer.get("quote")
     if quote and quote.get("message"):
@@ -1145,15 +1846,7 @@ def render_investment_assistant_answer(answer):
         else:
             st.caption(quote["message"])
 
-    st.subheader(f"{answer['stock_name']} {answer['stock_id']}".strip())
-    st.markdown(f"**結論：{answer['conclusion']}**")
-    st.markdown("**原因：**")
-    for reason in answer["reasons"]:
-        st.write(f"- {reason}")
-    st.markdown(f"**行動：** {answer['action']}")
-
-    with st.expander("本次判斷使用的資料"):
-        st.table(pd.DataFrame([answer["context"]]))
+    render_assistant_answer_card(answer, compact=False)
 
 
 def get_default_trade_price(holdings, stock_id):
@@ -1735,6 +2428,61 @@ def inject_dashboard_css():
             margin: 0.55rem 0;
             font-size: 0.88rem;
         }
+        .legend-row span {
+            min-width: 0;
+        }
+        .legend-row strong {
+            flex: 0 0 auto;
+            white-space: nowrap;
+        }
+        .asset-card {
+            min-height: 260px;
+        }
+        .asset-card .donut-wrap {
+            grid-template-columns: 1fr;
+            gap: 0.85rem;
+        }
+        .asset-card .donut {
+            width: min(150px, 58%);
+        }
+        .asset-card .donut-inner {
+            font-size: 0.95rem;
+        }
+        .asset-legend {
+            display: grid;
+            gap: 0.45rem;
+        }
+        .asset-legend .legend-row {
+            margin: 0;
+            border: 1px solid #edf1f8;
+            border-radius: 12px;
+            padding: 0.5rem 0.6rem;
+            background: #fbfcff;
+        }
+        .asset-breakdown {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 0.35rem;
+            margin-top: 0.65rem;
+        }
+        .asset-breakdown-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            color: var(--muted);
+            font-size: 0.82rem;
+            min-width: 0;
+            border: 1px solid #edf1f8;
+            border-radius: 12px;
+            background: #ffffff;
+            padding: 0.48rem 0.6rem;
+        }
+        .asset-breakdown-row strong {
+            color: var(--ink);
+            font-weight: 900;
+            white-space: nowrap;
+        }
         .dot {
             width: 9px;
             height: 9px;
@@ -1748,7 +2496,10 @@ def inject_dashboard_css():
             padding: 1rem;
             background: linear-gradient(180deg, #ffffff 0%, #fbfcff 100%);
             box-shadow: 0 10px 24px rgba(53, 73, 118, 0.06);
-            min-height: 236px;
+            min-height: 418px;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
         }
         .holdings-grid {
             display: grid;
@@ -1761,6 +2512,11 @@ def inject_dashboard_css():
             gap: 0.75rem;
             align-items: flex-start;
             margin-bottom: 0.65rem;
+            height: 54px;
+        }
+        .holding-title {
+            min-width: 0;
+            flex: 1 1 auto;
         }
         .symbol-badge {
             width: 42px;
@@ -1778,11 +2534,18 @@ def inject_dashboard_css():
             font-size: 0.82rem;
             margin-top: 0.08rem;
             line-height: 1.35;
+            height: 2.7em;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            word-break: break-word;
         }
         .holding-price {
             font-size: 1.35rem;
             font-weight: 900;
             margin: 0.3rem 0 0.45rem;
+            line-height: 1.2;
         }
         .sparkline-wrap {
             height: 66px;
@@ -1804,13 +2567,13 @@ def inject_dashboard_css():
             color: var(--muted);
             font-size: 0.8rem;
         }
-        }
         .card-grid {
             display: grid;
             grid-template-columns: repeat(2, minmax(0, 1fr));
             gap: 0.42rem 0.7rem;
             font-size: 0.76rem;
             color: var(--muted);
+            margin-top: auto;
         }
         .card-grid div {
             min-width: 0;
@@ -1829,6 +2592,10 @@ def inject_dashboard_css():
         }
         .positive { color: var(--red); font-weight: 900; }
         .negative { color: var(--green); font-weight: 900; }
+        .neutral { color: var(--muted); font-weight: 900; }
+        .card-grid strong.positive { color: var(--red); }
+        .card-grid strong.negative { color: var(--green); }
+        .card-grid strong.neutral { color: var(--muted); }
         .assistant-panel {
             background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
             border: 1px solid var(--line);
@@ -1844,6 +2611,141 @@ def inject_dashboard_css():
             color: #1f3566;
             margin-bottom: 0.75rem;
             font-weight: 700;
+        }
+        .assistant-result-card {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            background: linear-gradient(135deg, #f7f9ff, #ffffff);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 0.9rem;
+            margin: 0.75rem 0;
+        }
+        .result-label {
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 800;
+            margin-bottom: 0.2rem;
+        }
+        .result-conclusion {
+            color: var(--ink);
+            font-size: 1.1rem;
+            font-weight: 900;
+        }
+        .score-pill {
+            flex: 0 0 auto;
+            border-radius: 999px;
+            background: #f0edff;
+            color: #5e45d8;
+            padding: 0.45rem 0.7rem;
+            font-weight: 900;
+            font-size: 0.86rem;
+            white-space: nowrap;
+        }
+        .assistant-mini-answer {
+            border: 1px solid var(--line);
+            background: #fbfcff;
+            border-radius: 16px;
+            padding: 0.85rem;
+            margin-top: 0.75rem;
+        }
+        .assistant-mini-answer ul {
+            margin: 0.4rem 0 0.65rem 1.1rem;
+            padding: 0;
+        }
+        .assistant-mini-answer li {
+            margin: 0.25rem 0;
+            color: var(--muted);
+            font-size: 0.86rem;
+        }
+        .assistant-action {
+            border-radius: 12px;
+            background: #edf3ff;
+            color: #20366f;
+            padding: 0.65rem 0.75rem;
+            font-weight: 800;
+            font-size: 0.9rem;
+        }
+        .assistant-answer-card {
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            background: #ffffff;
+            box-shadow: 0 12px 30px rgba(53, 73, 118, 0.07);
+            padding: 1rem;
+            margin-top: 0.85rem;
+        }
+        .assistant-answer-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            margin-bottom: 0.75rem;
+        }
+        .assistant-answer-title h4 {
+            margin: 0;
+            font-size: 1rem;
+        }
+        .assistant-reasons {
+            display: grid;
+            gap: 0.45rem;
+            margin: 0.75rem 0;
+        }
+        .assistant-reason {
+            border: 1px solid #edf1f8;
+            border-radius: 12px;
+            background: #fbfcff;
+            color: #28344f;
+            padding: 0.55rem 0.65rem;
+            font-size: 0.9rem;
+            line-height: 1.45;
+        }
+        .assistant-section-label {
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 900;
+            margin-top: 0.75rem;
+        }
+        .assistant-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.55rem;
+            margin-top: 0.5rem;
+        }
+        .assistant-summary-item {
+            border: 1px solid #edf1f8;
+            border-radius: 12px;
+            background: #fbfcff;
+            padding: 0.55rem 0.65rem;
+            color: var(--muted);
+            font-size: 0.82rem;
+            line-height: 1.4;
+        }
+        .assistant-context-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.45rem;
+            margin-top: 0.55rem;
+        }
+        .assistant-context-item {
+            border: 1px solid #edf1f8;
+            border-radius: 10px;
+            padding: 0.45rem 0.55rem;
+            background: #ffffff;
+        }
+        .assistant-context-item span {
+            display: block;
+            color: var(--muted);
+            font-size: 0.72rem;
+            font-weight: 800;
+        }
+        .assistant-context-item strong {
+            display: block;
+            color: var(--ink);
+            font-size: 0.86rem;
+            margin-top: 0.12rem;
+            word-break: break-word;
         }
         .entry-card {
             min-height: 154px;
@@ -1878,12 +2780,13 @@ def inject_dashboard_css():
             cursor: help;
         }
         .health-score {
-            display: flex;
+            display: grid;
+            grid-template-columns: 112px minmax(0, 1fr);
             align-items: center;
-            gap: 1.2rem;
+            gap: 0.9rem;
         }
         .score-ring {
-            width: 150px;
+            width: 112px;
             aspect-ratio: 1;
             border-radius: 50%;
             background: conic-gradient(#34c96b 0 var(--score-deg), #edf1f8 var(--score-deg) 360deg);
@@ -1897,8 +2800,38 @@ def inject_dashboard_css():
             background: white;
             display: grid;
             place-items: center;
-            font-size: 1.7rem;
+            font-size: 1.35rem;
             font-weight: 900;
+        }
+        .score-ring small {
+            font-size: 0.65rem;
+            color: var(--muted);
+            margin-left: 0.1rem;
+        }
+        .health-items {
+            display: grid;
+            gap: 0.48rem;
+            min-width: 0;
+        }
+        .health-item {
+            border: 1px solid #edf1f8;
+            border-radius: 12px;
+            background: #fbfcff;
+            padding: 0.5rem 0.6rem;
+        }
+        .health-item span {
+            display: block;
+            color: var(--muted);
+            font-size: 0.76rem;
+            font-weight: 800;
+            margin-bottom: 0.16rem;
+        }
+        .health-item strong {
+            display: block;
+            color: var(--ink);
+            font-size: 0.86rem;
+            line-height: 1.35;
+            word-break: break-word;
         }
         .news-row {
             display: flex;
@@ -1914,8 +2847,8 @@ def inject_dashboard_css():
             .dashboard-title { display: block; }
             .donut-wrap { grid-template-columns: 1fr; }
             .holdings-grid { grid-template-columns: 1fr !important; }
-            .health-score { display: block; }
-            .score-ring { margin-bottom: 1rem; }
+            .health-score { grid-template-columns: 1fr; }
+            .score-ring { margin: 0 auto 0.6rem; }
             .metric-value { font-size: 1.45rem; }
             .entry-desc { min-height: auto; }
         }
@@ -2007,17 +2940,23 @@ def render_asset_allocation_card(stock_market_value, cash, real_estate_value_tot
     cash_deg = (stock_ratio_value + cash_ratio_value) * 360
     st.markdown(
         f"""
-        <div class="soft-card">
+        <div class="soft-card asset-card">
             <div class="section-title"><h3>資產配置</h3><span class="pill">總資產占比</span></div>
             <div class="donut-wrap">
                 <div class="donut" style="--stock-deg:{stock_deg:.1f}deg;--cash-deg:{cash_deg:.1f}deg;">
                     <div class="donut-inner"><div>股票<br>{stock_ratio_value * 100:.0f}%</div></div>
                 </div>
-                <div>
+                <div class="asset-card-body">
+                    <div class="asset-legend">
                     <div class="legend-row"><span><span class="dot" style="background:#4f73ff"></span>股票</span><strong>{format_percent(stock_ratio_value)}</strong></div>
                     <div class="legend-row"><span><span class="dot" style="background:#7fd8e4"></span>現金</span><strong>{format_percent(cash_ratio_value)}</strong></div>
                     <div class="legend-row"><span><span class="dot" style="background:#ffd872"></span>不動產</span><strong>{format_percent(real_estate_ratio)}</strong></div>
-                    <div class="metric-help">股票 {format_currency(stock_market_value)} / 現金 {format_currency(cash)} / 房產 {format_currency(real_estate_value_total)}</div>
+                    </div>
+                    <div class="asset-breakdown">
+                        <div class="asset-breakdown-row"><span>股票市值</span><strong>{format_currency(stock_market_value)}</strong></div>
+                        <div class="asset-breakdown-row"><span>現金</span><strong>{format_currency(cash)}</strong></div>
+                        <div class="asset-breakdown-row"><span>房產</span><strong>{format_currency(real_estate_value_total)}</strong></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2031,8 +2970,15 @@ def build_holding_card_html(row):
     stock_name = str(row["\u80a1\u7968\u540d\u7a31"])
     return_rate = row["\u5831\u916c\u7387"]
     profit = row["\u672a\u5be6\u73fe\u640d\u76ca"]
-    tone_class = "positive" if not pd.isna(profit) and profit >= 0 else "negative"
-    sign = "\u25b2" if tone_class == "positive" else "\u25bc"
+    if pd.isna(profit) or profit == 0:
+        tone_class = "neutral"
+        sign = ""
+    elif profit > 0:
+        tone_class = "positive"
+        sign = "\u25b2"
+    else:
+        tone_class = "negative"
+        sign = "\u25bc"
     current_price = format_price(row["\u73fe\u50f9"])
     quantity = row["\u6301\u6709\u80a1\u6578"]
     market_value = format_currency(row["\u76ee\u524d\u5e02\u503c"])
@@ -2045,11 +2991,11 @@ def build_holding_card_html(row):
     return f"""
         <div class="holding-card">
             <div class="holding-top">
-                <div>
+                <div class="holding-title">
                     <div class="stock-code">{escape(stock_id)}</div>
-                    <div class="stock-name">{escape(stock_name)}</div>
+                    <div class="stock-name" title="{escape(stock_name)}">{escape(stock_name)}</div>
                 </div>
-                <div class="{tone_class}" title="報酬率：目前未實現損益 / 總投入成本">{sign} {escape(format_percent(return_rate))}</div>
+                <div class="{tone_class}" title="報酬率：目前未實現損益 / 總投入成本">{escape((sign + ' ') if sign else '')}{escape(format_percent(return_rate))}</div>
             </div>
             <div class="holding-price">$ {escape(current_price)}</div>
             <div class="sparkline-wrap" title="最近 3 個月真實收盤價走勢，資料來源 Yahoo Finance">{sparkline_svg}</div>
@@ -2147,10 +3093,10 @@ def render_health_card(score, mortgage_buffer_months, cash_gap_to_12m_mortgage, 
             <div class="section-title"><h3>投資組合健康度</h3><span class="pill">{escape(status)}</span></div>
             <div class="health-score">
                 <div class="score-ring" title="健康度：依現金水位、集中度、股票曝險計算的簡化分數" style="--score-deg:{score_deg:.1f}deg;"><span>{score}<small>/100</small></span></div>
-                <div>
-                    <div class="legend-row"><span>資產配置</span><strong>{escape(concentration_note)}</strong></div>
-                    <div class="legend-row"><span>現金水位</span><strong>{escape(cash_note)}</strong></div>
-                    <div class="legend-row"><span>房貸緩衝</span><strong>{escape(gap_note)}</strong></div>
+                <div class="health-items">
+                    <div class="health-item"><span>資產配置</span><strong>{escape(concentration_note)}</strong></div>
+                    <div class="health-item"><span>現金水位</span><strong>{escape(cash_note)}</strong></div>
+                    <div class="health-item"><span>房貸緩衝</span><strong>{escape(gap_note)}</strong></div>
                 </div>
             </div>
         </div>
@@ -2238,14 +3184,14 @@ def render_dashboard_assistant(holdings_df, cash, stock_market_value, overall_as
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="chat-bubble">可以問：00919 可以加碼嗎？群創要不要賣？台股大跌怎麼辦？</div>',
+        '<div class="chat-bubble">可以問：00919 可以加碼嗎？聯電適合我嗎？台股大跌怎麼辦？</div>',
         unsafe_allow_html=True,
     )
     with st.form("dashboard_assistant_form"):
         assistant_question = st.text_input(
             "輸入投資問題",
             value="",
-            placeholder="輸入你的投資問題...",
+            placeholder="問一句，例如：00830適合我嗎？",
             label_visibility="collapsed",
         )
         assistant_submitted = st.form_submit_button("送出")
@@ -2259,13 +3205,50 @@ def render_dashboard_assistant(holdings_df, cash, stock_market_value, overall_as
             monthly_mortgage_total,
             mortgage_buffer_months,
         )
-        st.markdown(f"**結論：{answer['conclusion']}**")
-        for reason in answer["reasons"][:2]:
-            st.caption(reason)
-        st.info(answer["action"])
+        quote = answer.get("quote")
+        if quote and quote.get("price") is None:
+            st.error("行情資料暫時無法更新")
+        elif quote and quote.get("is_fallback"):
+            st.warning(quote.get("message", "使用最近收盤價。"))
+        render_assistant_answer_card(answer, compact=True)
     else:
-        st.caption("回答會依照目前持股、成本、現金水位、房貸緩衝與持股比例產生。")
+        st.caption("我會同時看你的持股、現金、房貸、集中度與標的近期狀況，不會建議重壓或 All in。")
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_full_assistant_section(holdings_df, cash, stock_market_value, overall_asset_total, monthly_mortgage_total, mortgage_buffer_months):
+    render_back_to_dashboard()
+    st.header("投資決策助手")
+    st.caption("用人話問就可以。系統會同時看你的資產配置、現金水位、房貸壓力、持股集中度與標的行情。")
+    st.markdown(
+        """
+        <div class="chat-bubble">範例：00919可以加碼嗎？群創要不要賣？00830適合我嗎？聯電現在可以布局嗎？台股大跌怎麼辦？</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.form("full_investment_assistant_form"):
+        assistant_question = st.text_input(
+            "輸入你的問題",
+            value="",
+            placeholder="例如：00830適合我嗎？",
+        )
+        assistant_submitted = st.form_submit_button("取得建議")
+
+    if assistant_question.strip() and assistant_submitted:
+        assistant_answer = build_investment_assistant_answer(
+            assistant_question,
+            holdings_df,
+            cash,
+            stock_market_value,
+            overall_asset_total,
+            monthly_mortgage_total,
+            mortgage_buffer_months,
+        )
+        render_investment_assistant_answer(assistant_answer)
+    elif assistant_question.strip():
+        st.caption("按「取得建議」後，我會依目前持股、現金與房貸安全水位回答。")
+    else:
+        st.caption("也可以問未持有標的，例如 00830、聯電；適合度分數代表它適不適合你目前配置，不是股票好壞分數。")
 
 
 def render_dashboard(
@@ -2632,9 +3615,7 @@ if active_section == "總覽儀表板":
     st.stop()
 
 if active_section == "投資助理":
-    render_back_to_dashboard()
-    st.header("投資決策助手")
-    render_dashboard_assistant(
+    render_full_assistant_section(
         holdings_df,
         cash,
         stock_market_value,
