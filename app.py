@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import re
 import subprocess
 from io import StringIO
 from pathlib import Path
@@ -429,15 +430,58 @@ def build_holdings(transactions):
 
 @st.cache_data(ttl=3600)
 def get_current_price(stock_id):
+    quote = get_market_quote(stock_id)
+    return quote["price"]
+
+
+@st.cache_data(ttl=300)
+def get_market_quote(stock_id):
+    stock_id = str(stock_id).strip().upper()
+    quote = {
+        "price": None,
+        "source": None,
+        "is_fallback": False,
+        "message": "行情資料暫時無法更新",
+    }
+
     twse_info = fetch_twse_stock_info(stock_id)
-    twse_price = parse_twse_price(twse_info)
+    twse_price = None
+    twse_price_key = None
+    if twse_info:
+        for key in ["z", "pz"]:
+            value = twse_info.get(key)
+            try:
+                parsed_price = float(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed_price > 0:
+                twse_price = parsed_price
+                twse_price_key = key
+                break
+
     if twse_price is not None:
-        return twse_price
+        if twse_price_key == "z":
+            quote.update(
+                {
+                    "price": twse_price,
+                    "source": "TWSE MIS 即時成交價",
+                    "message": "已使用 TWSE MIS 即時或近即時行情。",
+                }
+            )
+        else:
+            quote.update(
+                {
+                    "price": twse_price,
+                    "source": "TWSE MIS 近即時參考價",
+                    "is_fallback": True,
+                    "message": "即時成交價暫時不可用，已使用 TWSE MIS 近即時參考價。",
+                }
+            )
+        return quote
 
     if yf is None:
-        return None
+        return quote
 
-    stock_id = str(stock_id).strip()
     for suffix in [".TW", ".TWO"]:
         ticker_symbol = f"{stock_id}{suffix}"
         try:
@@ -449,6 +493,32 @@ def get_current_price(stock_id):
                 ticker = yf.Ticker(ticker_symbol, session=session)
             except Exception:
                 ticker = yf.Ticker(ticker_symbol)
+        except Exception:
+            continue
+
+        try:
+            fast_info = ticker.fast_info
+            for key in ["lastPrice", "regularMarketPreviousClose", "previousClose"]:
+                price = fast_info.get(key)
+                if price and float(price) > 0:
+                    is_fallback = key != "lastPrice"
+                    quote.update(
+                        {
+                            "price": float(price),
+                            "source": "Yahoo Finance 近即時價格" if not is_fallback else "Yahoo Finance 最近收盤價",
+                            "is_fallback": is_fallback,
+                            "message": (
+                                "已使用 Yahoo Finance 近即時行情。"
+                                if not is_fallback
+                                else "即時行情暫時不可用，已使用 Yahoo Finance 最近收盤價。"
+                            ),
+                        }
+                    )
+                    return quote
+        except Exception:
+            pass
+
+        try:
             history = ticker.history(period="5d", interval="1d", auto_adjust=False)
         except Exception:
             continue
@@ -458,18 +528,17 @@ def get_current_price(stock_id):
             if not close_prices.empty:
                 price = float(close_prices.iloc[-1])
                 if price > 0:
-                    return price
+                    quote.update(
+                        {
+                            "price": price,
+                            "source": "Yahoo Finance 最近收盤價",
+                            "is_fallback": True,
+                            "message": "即時行情暫時不可用，已使用 Yahoo Finance 最近收盤價。",
+                        }
+                    )
+                    return quote
 
-        try:
-            fast_info = ticker.fast_info
-            for key in ["lastPrice", "regularMarketPreviousClose", "previousClose"]:
-                price = fast_info.get(key)
-                if price and float(price) > 0:
-                    return float(price)
-        except Exception:
-            continue
-
-    return None
+    return quote
 
 
 @st.cache_data(ttl=3600)
@@ -749,6 +818,232 @@ def find_holding(holdings, stock_id):
     if matched.empty:
         return None
     return matched.iloc[0]
+
+
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def extract_stock_from_question(question, holdings):
+    question = str(question).strip().upper()
+    code_match = re.search(r"\b\d{4,6}[A-Z]?\b", question)
+    if code_match:
+        return code_match.group(0)
+
+    if holdings.empty:
+        return ""
+
+    for _, row in holdings.iterrows():
+        stock_name = str(row["\u80a1\u7968\u540d\u7a31"]).strip().upper()
+        stock_id = str(row["\u80a1\u7968\u4ee3\u865f"]).strip().upper()
+        if stock_name and stock_name in question:
+            return stock_id
+
+    return ""
+
+
+def detect_question_intent(question):
+    text = str(question)
+    if any(keyword in text for keyword in ["賣", "減碼", "停損", "出場"]):
+        return "sell"
+    if any(keyword in text for keyword in ["加碼", "買", "進場", "佈局", "布局"]):
+        return "buy"
+    if any(keyword in text for keyword in ["大跌", "崩", "下跌", "怎麼辦", "恐慌", "殺盤"]):
+        return "market"
+    return "hold"
+
+
+def append_unique(items, item):
+    if item and item not in items:
+        items.append(item)
+
+
+def build_chat_action_line(conclusion, price, avg_cost, is_held, conservative_mode):
+    if pd.isna(price) or price <= 0:
+        return "先等待行情恢復，再做買賣判斷。"
+
+    if conclusion == "建議買":
+        target_price = price * 0.98
+        if is_held and avg_cost > 0:
+            target_price = min(target_price, avg_cost * 0.97)
+        return f"只用小額分批，價格低於 {format_price(target_price)} 且現金仍高於 6 個月房貸時再買。"
+
+    if conclusion == "不買":
+        return f"除非現金補回 6 個月房貸以上，且價格回到 {format_price(price * 0.95)} 以下，否則先不加碼。"
+
+    if conclusion == "減碼":
+        return f"若反彈到 {format_price(price * 1.03)} 附近仍無法改善持股壓力，可分批減碼。"
+
+    if conclusion == "續抱":
+        stop_review_price = avg_cost * 0.90 if is_held and avg_cost > 0 else price * 0.92
+        return f"續抱觀察；若跌破 {format_price(stop_review_price)}，重新檢查是否需要減碼。"
+
+    if conservative_mode:
+        return "先把現金補到 6 個月房貸以上，再評估下一筆買進。"
+    return f"等待價格接近 {format_price(price * 0.97)}，或大盤止穩後再分批處理。"
+
+
+def build_investment_assistant_answer(
+    question,
+    holdings,
+    cash,
+    stock_market_value,
+    overall_asset_total,
+    monthly_mortgage_total,
+    mortgage_buffer_months,
+):
+    question = str(question).strip()
+    stock_id = extract_stock_from_question(question, holdings)
+    intent = detect_question_intent(question)
+    cash_buffer_months = None if pd.isna(mortgage_buffer_months) else float(mortgage_buffer_months)
+    conservative_mode = cash_buffer_months is not None and cash_buffer_months < 6
+    stock_exposure_ratio = stock_market_value / overall_asset_total if overall_asset_total else 0
+    cash_ratio_all_assets = cash / overall_asset_total if overall_asset_total else 0
+
+    if not stock_id:
+        reasons = []
+        if conservative_mode:
+            append_unique(reasons, f"現金只夠 {format_months(cash_buffer_months)} 房貸，先保守。")
+        append_unique(reasons, f"股票總曝險約 {format_percent(stock_exposure_ratio)}。")
+        append_unique(reasons, "遇到大跌時先控制節奏，不做重壓或 All in。")
+        return {
+            "stock_id": "",
+            "stock_name": "整體市場",
+            "quote": None,
+            "conclusion": "等待",
+            "reasons": reasons[:3],
+            "action": "先保留至少 6 個月房貸現金；若要買，只分批且單筆不要讓現金低於安全水位。",
+            "context": {
+                "現金": format_currency(cash),
+                "現金可支應房貸": format_months(cash_buffer_months),
+                "股票總曝險": format_percent(stock_exposure_ratio),
+            },
+        }
+
+    quote = get_market_quote(stock_id)
+    price = quote["price"]
+    current_holding = find_holding(holdings, stock_id)
+    stock_name = (
+        str(current_holding["\u80a1\u7968\u540d\u7a31"])
+        if current_holding is not None
+        else get_stock_name(stock_id) or stock_id
+    )
+
+    if price is None or pd.isna(price):
+        return {
+            "stock_id": stock_id,
+            "stock_name": stock_name,
+            "quote": quote,
+            "conclusion": "等待",
+            "reasons": ["行情資料暫時無法更新。", "沒有可靠價格時，不適合做買賣決策。"],
+            "action": "等行情恢復後，再用目前價格、成本與現金水位重新判斷。",
+            "context": {
+                "現金": format_currency(cash),
+                "現金可支應房貸": format_months(cash_buffer_months),
+                "股票總曝險": format_percent(stock_exposure_ratio),
+            },
+        }
+
+    is_held = current_holding is not None
+    avg_cost = safe_float(current_holding["\u5e73\u5747\u6210\u672c"]) if is_held else 0
+    market_value = safe_float(current_holding["\u76ee\u524d\u5e02\u503c"]) if is_held else 0
+    unrealized_profit = safe_float(current_holding["\u672a\u5be6\u73fe\u640d\u76ca"]) if is_held else 0
+    return_rate = current_holding["\u5831\u916c\u7387"] if is_held else pd.NA
+    asset_ratio = market_value / overall_asset_total if overall_asset_total and is_held else 0
+    asset_type = (
+        str(current_holding["\u985e\u578b"])
+        if is_held
+        else classify_asset_type(pd.Series({"\u80a1\u7968\u4ee3\u865f": stock_id, "\u80a1\u7968\u540d\u7a31": stock_name}))
+    )
+    concentration_limit = ETF_NO_ADD_THRESHOLD if asset_type == "ETF / \u50b5\u5238 ETF" else STOCK_NO_ADD_THRESHOLD
+    high_concentration = asset_ratio >= concentration_limit
+
+    reasons = []
+    if conservative_mode:
+        append_unique(reasons, f"現金只夠 {format_months(cash_buffer_months)} 房貸，預設偏保守。")
+    elif monthly_mortgage_total:
+        append_unique(reasons, f"現金可支應約 {format_months(cash_buffer_months)} 房貸。")
+    else:
+        append_unique(reasons, f"現金水位約占總資產 {format_percent(cash_ratio_all_assets)}。")
+
+    if is_held:
+        append_unique(
+            reasons,
+            f"成本 {format_price(avg_cost)}、現價 {format_price(price)}、未實現損益 {format_currency(unrealized_profit)}。",
+        )
+        append_unique(reasons, f"{stock_name} 占總資產約 {format_percent(asset_ratio)}，股票總曝險約 {format_percent(stock_exposure_ratio)}。")
+    else:
+        append_unique(reasons, f"{stock_name} 目前價格約 {format_price(price)}，但尚未在持股內。")
+        append_unique(reasons, f"股票總曝險約 {format_percent(stock_exposure_ratio)}。")
+
+    if quote["is_fallback"]:
+        append_unique(reasons, quote["message"])
+
+    return_rate_value = safe_float(return_rate, pd.NA)
+    if intent == "sell" and is_held:
+        if high_concentration or (not pd.isna(return_rate_value) and return_rate_value < -0.15):
+            conclusion = "減碼"
+        else:
+            conclusion = "續抱"
+    elif intent == "buy":
+        if conservative_mode or high_concentration:
+            conclusion = "不買"
+        elif is_held and not pd.isna(return_rate_value) and return_rate_value > 0.20:
+            conclusion = "等待"
+        else:
+            conclusion = "建議買"
+    elif intent == "market":
+        conclusion = "等待"
+    else:
+        conclusion = "等待" if conservative_mode or not is_held else "續抱"
+
+    if conclusion in ["建議買", "不買"]:
+        append_unique(reasons, "即使條件符合，也只適合小額分批，不建議重壓或 All in。")
+
+    return {
+        "stock_id": stock_id,
+        "stock_name": stock_name,
+        "quote": quote,
+        "conclusion": conclusion,
+        "reasons": reasons[:3],
+        "action": build_chat_action_line(conclusion, price, avg_cost, is_held, conservative_mode),
+        "context": {
+            "目前價格": format_price(price),
+            "行情來源": quote["source"] or "無",
+            "平均成本": format_price(avg_cost) if is_held else "未持有",
+            "未實現損益": format_currency(unrealized_profit) if is_held else "未持有",
+            "持股占總資產": format_percent(asset_ratio) if is_held else "未持有",
+            "現金": format_currency(cash),
+            "現金可支應房貸": format_months(cash_buffer_months),
+            "股票總曝險": format_percent(stock_exposure_ratio),
+        },
+    }
+
+
+def render_investment_assistant_answer(answer):
+    quote = answer.get("quote")
+    if quote and quote.get("message"):
+        if quote.get("price") is None:
+            st.error("行情資料暫時無法更新")
+        elif quote.get("is_fallback"):
+            st.warning(quote["message"])
+        else:
+            st.caption(quote["message"])
+
+    st.subheader(f"{answer['stock_name']} {answer['stock_id']}".strip())
+    st.markdown(f"**結論：{answer['conclusion']}**")
+    st.markdown("**原因：**")
+    for reason in answer["reasons"]:
+        st.write(f"- {reason}")
+    st.markdown(f"**行動：** {answer['action']}")
+
+    with st.expander("本次判斷使用的資料"):
+        st.table(pd.DataFrame([answer["context"]]))
 
 
 def get_default_trade_price(holdings, stock_id):
@@ -1364,6 +1659,31 @@ for level, message in build_today_conclusions(
         st.success(message)
     else:
         st.info(message)
+
+st.header("對話式投資決策助手")
+with st.form("investment_assistant_form"):
+    assistant_question = st.text_input(
+        "輸入你的問題",
+        value="",
+        placeholder="例如：00919可以加碼嗎、群創要不要賣、台股大跌我該怎麼辦",
+    )
+    assistant_submitted = st.form_submit_button("取得建議")
+
+if assistant_question.strip() and assistant_submitted:
+    assistant_answer = build_investment_assistant_answer(
+        assistant_question,
+        holdings_df,
+        cash,
+        stock_market_value,
+        overall_asset_total,
+        monthly_mortgage_total,
+        mortgage_buffer_months,
+    )
+    render_investment_assistant_answer(assistant_answer)
+elif assistant_question.strip():
+    st.caption("按「取得建議」後，系統會依目前持股、現金與房貸安全水位回答。")
+else:
+    st.caption("可輸入標的代號、持股名稱或整體市場問題；系統會依目前持股、現金與房貸安全水位回答。")
 
 st.header("買入 / 賣出模擬器")
 st.caption("集中度提醒：個股 15% 提醒、20% 不建議加碼；ETF 30% 提醒、35% 不建議加碼。")
