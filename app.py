@@ -2,8 +2,10 @@
 import json
 import re
 import subprocess
+from html import escape
 from io import StringIO
 from pathlib import Path
+from urllib.parse import quote
 from urllib.request import ProxyHandler, build_opener
 
 import pandas as pd
@@ -434,6 +436,102 @@ def get_current_price(stock_id):
     return quote["price"]
 
 
+@st.cache_data(ttl=3600)
+def get_price_history(stock_id, period="3mo", interval="1d"):
+    stock_id = str(stock_id).strip().upper()
+
+    for suffix in [".TW", ".TWO"]:
+        ticker_symbol = f"{stock_id}{suffix}"
+        yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}"
+        params = {"range": period, "interval": interval}
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        for request_getter in ["requests", "curl_cffi"]:
+            try:
+                if request_getter == "requests":
+                    session = requests.Session()
+                    session.trust_env = False
+                    response = session.get(yahoo_url, params=params, headers=headers, timeout=CSV_READ_TIMEOUT_SECONDS)
+                else:
+                    from curl_cffi import requests as curl_requests
+
+                    response = curl_requests.get(
+                        yahoo_url,
+                        params=params,
+                        headers=headers,
+                        timeout=CSV_READ_TIMEOUT_SECONDS,
+                        impersonate="chrome",
+                    )
+
+                response.raise_for_status()
+                result = response.json().get("chart", {}).get("result") or []
+                closes = (result[0].get("indicators", {}).get("quote") or [{}])[0].get("close") or []
+                prices = [float(value) for value in closes if value and float(value) > 0]
+                if len(prices) >= 2:
+                    return prices[-60:]
+            except Exception:
+                continue
+
+    if yf is None:
+        return []
+
+    for suffix in [".TW", ".TWO"]:
+        ticker_symbol = f"{stock_id}{suffix}"
+        try:
+            try:
+                from curl_cffi import requests as curl_requests
+
+                session = curl_requests.Session(impersonate="chrome")
+                session.trust_env = False
+                ticker = yf.Ticker(ticker_symbol, session=session)
+            except Exception:
+                ticker = yf.Ticker(ticker_symbol)
+
+            history = ticker.history(period=period, interval=interval, auto_adjust=False)
+        except Exception:
+            continue
+
+        if history.empty or "Close" not in history.columns:
+            continue
+
+        close_prices = history["Close"].dropna()
+        close_prices = close_prices[close_prices > 0]
+        if len(close_prices) >= 2:
+            return [float(value) for value in close_prices.tail(60).tolist()]
+
+    return []
+
+
+def build_sparkline_svg(prices, positive=True):
+    if len(prices) < 2:
+        return '<div class="sparkline-empty">走勢暫無資料</div>'
+
+    width = 260
+    height = 62
+    padding = 5
+    min_price = min(prices)
+    max_price = max(prices)
+    price_range = max_price - min_price
+    if price_range == 0:
+        price_range = max_price if max_price else 1
+
+    points = []
+    for index, price in enumerate(prices):
+        x = padding + index * (width - padding * 2) / (len(prices) - 1)
+        y = height - padding - ((price - min_price) / price_range) * (height - padding * 2)
+        points.append(f"{x:.1f},{y:.1f}")
+
+    line_color = "#e9465b" if positive else "#0fa968"
+    fill_color = "rgba(233, 70, 91, 0.12)" if positive else "rgba(15, 169, 104, 0.12)"
+    area_points = f"{padding},{height - padding} " + " ".join(points) + f" {width - padding},{height - padding}"
+    return f"""
+        <svg class="sparkline" viewBox="0 0 {width} {height}" preserveAspectRatio="none" role="img" aria-label="最近 3 個月真實收盤價走勢">
+            <polyline points="{area_points}" fill="{fill_color}" stroke="none"></polyline>
+            <polyline points="{' '.join(points)}" fill="none" stroke="{line_color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"></polyline>
+        </svg>
+    """
+
+
 @st.cache_data(ttl=300)
 def get_market_quote(stock_id):
     stock_id = str(stock_id).strip().upper()
@@ -766,6 +864,18 @@ def estimate_transaction_tax(row):
 def format_currency(value):
     if pd.isna(value):
         return "\u7121\u6cd5\u53d6\u5f97"
+    return f"{value:,.0f}"
+
+
+def format_compact_currency(value):
+    if pd.isna(value):
+        return "\u7121\u6cd5\u53d6\u5f97"
+    value = float(value)
+    abs_value = abs(value)
+    if abs_value >= 100000000:
+        return f"{value / 100000000:,.2f}\u5104"
+    if abs_value >= 10000:
+        return f"{value / 10000:,.1f}\u842c"
     return f"{value:,.0f}"
 
 
@@ -1442,49 +1552,969 @@ def build_watchlist(holdings):
     return pd.DataFrame(watch_rows, columns=["股票代號", "股票名稱", "原因", "建議動作"])
 
 
+def inject_dashboard_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --card-bg: rgba(255, 255, 255, 0.94);
+            --line: #e6ebf7;
+            --ink: #172033;
+            --muted: #6d7890;
+            --primary: #4f73ff;
+            --violet: #7b5cff;
+            --green: #0fa968;
+            --red: #e9465b;
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(96, 119, 255, 0.13), transparent 34rem),
+                radial-gradient(circle at top right, rgba(255, 184, 107, 0.12), transparent 28rem),
+                #f7f9fd;
+            color: var(--ink);
+        }
+        section[data-testid="stSidebar"] {
+            display: none;
+        }
+        .block-container {
+            padding-top: 1.1rem;
+            padding-bottom: 2.2rem;
+            max-width: 1280px;
+            margin: 0 auto;
+        }
+        .dashboard-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            margin: 0.1rem 0 0.85rem;
+            min-height: 52px;
+        }
+        .dashboard-title h1 {
+            margin: 0;
+            font-size: 2rem;
+            letter-spacing: 0;
+        }
+        .dashboard-title p {
+            margin: 0.25rem 0 0;
+            color: var(--muted);
+            font-size: 0.95rem;
+        }
+        .soft-card {
+            background: var(--card-bg);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            box-shadow: 0 16px 38px rgba(53, 73, 118, 0.09);
+            padding: 1.05rem;
+            min-height: 100%;
+        }
+        .settings-card {
+            background: rgba(255, 255, 255, 0.86);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            box-shadow: 0 12px 28px rgba(53, 73, 118, 0.07);
+            padding: 0.55rem 0.85rem 0.2rem;
+            margin-bottom: 0.8rem;
+        }
+        .metric-card {
+            min-height: 132px;
+            position: relative;
+            overflow: hidden;
+        }
+        .metric-card::after {
+            content: "";
+            position: absolute;
+            right: -48px;
+            bottom: -54px;
+            width: 104px;
+            height: 104px;
+            border-radius: 50%;
+            background: var(--accent-soft);
+            opacity: 0.38;
+            z-index: 0;
+            pointer-events: none;
+        }
+        .metric-card > * {
+            position: relative;
+            z-index: 1;
+        }
+        .metric-label {
+            color: var(--accent);
+            font-size: 0.9rem;
+            font-weight: 800;
+            margin-bottom: 0.65rem;
+        }
+        .metric-value {
+            color: var(--ink);
+            font-size: 1.55rem;
+            font-weight: 900;
+            line-height: 1.15;
+            word-break: keep-all;
+            white-space: nowrap;
+        }
+        .metric-help {
+            color: var(--muted);
+            font-size: 0.82rem;
+            margin-top: 0.5rem;
+        }
+        .metric-delta {
+            color: var(--green);
+            font-size: 0.82rem;
+            font-weight: 800;
+            margin-top: 0.55rem;
+        }
+        .section-title {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.8rem;
+            margin-bottom: 0.8rem;
+        }
+        .section-title h3 {
+            margin: 0;
+            font-size: 1.12rem;
+        }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 999px;
+            background: #edf3ff;
+            color: #3157d5;
+            padding: 0.34rem 0.7rem;
+            font-size: 0.78rem;
+            font-weight: 800;
+        }
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            color: var(--muted);
+            font-size: 0.86rem;
+            font-weight: 700;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            box-shadow: 0 0 0 4px rgba(15, 169, 104, 0.12);
+        }
+        .donut-wrap {
+            display: grid;
+            grid-template-columns: minmax(150px, 0.9fr) 1fr;
+            gap: 1rem;
+            align-items: center;
+        }
+        .donut {
+            width: min(190px, 100%);
+            aspect-ratio: 1;
+            border-radius: 50%;
+            background: conic-gradient(#4f73ff 0 var(--stock-deg), #7fd8e4 var(--stock-deg) var(--cash-deg), #ffd872 var(--cash-deg) 360deg);
+            display: grid;
+            place-items: center;
+            margin: 0 auto;
+        }
+        .donut-inner {
+            width: 58%;
+            aspect-ratio: 1;
+            background: white;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            text-align: center;
+            box-shadow: inset 0 0 18px rgba(47, 69, 128, 0.08);
+            font-weight: 900;
+        }
+        .legend-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.6rem;
+            color: var(--muted);
+            margin: 0.55rem 0;
+            font-size: 0.88rem;
+        }
+        .dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 0.45rem;
+        }
+        .holding-card {
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 1rem;
+            background: linear-gradient(180deg, #ffffff 0%, #fbfcff 100%);
+            box-shadow: 0 10px 24px rgba(53, 73, 118, 0.06);
+            min-height: 236px;
+        }
+        .holdings-grid {
+            display: grid;
+            grid-template-columns: repeat(var(--cards-per-row, 2), minmax(0, 1fr));
+            gap: 1rem;
+        }
+        .holding-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.75rem;
+            align-items: flex-start;
+            margin-bottom: 0.65rem;
+        }
+        .symbol-badge {
+            width: 42px;
+            height: 42px;
+            border-radius: 13px;
+            background: linear-gradient(135deg, #e8eeff, #f4eaff);
+            color: var(--violet);
+            display: grid;
+            place-items: center;
+            font-weight: 900;
+        }
+        .stock-code { font-weight: 900; font-size: 1rem; }
+        .stock-name {
+            color: var(--muted);
+            font-size: 0.82rem;
+            margin-top: 0.08rem;
+            line-height: 1.35;
+        }
+        .holding-price {
+            font-size: 1.35rem;
+            font-weight: 900;
+            margin: 0.3rem 0 0.45rem;
+        }
+        .sparkline-wrap {
+            height: 66px;
+            margin: 0.25rem 0 0.75rem;
+            border-radius: 12px;
+            background: linear-gradient(180deg, rgba(246, 248, 255, 0.9), rgba(255, 255, 255, 0.65));
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+        }
+        .sparkline {
+            width: 100%;
+            height: 62px;
+            display: block;
+        }
+        .sparkline-empty {
+            width: 100%;
+            text-align: center;
+            color: var(--muted);
+            font-size: 0.8rem;
+        }
+        }
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.42rem 0.7rem;
+            font-size: 0.76rem;
+            color: var(--muted);
+        }
+        .card-grid div {
+            min-width: 0;
+            display: flex;
+            justify-content: space-between;
+            gap: 0.4rem;
+            border-top: 1px solid #eef2f8;
+            padding-top: 0.35rem;
+        }
+        .card-grid strong {
+            color: var(--ink);
+            display: inline;
+            margin-top: 0;
+            word-break: break-word;
+            text-align: right;
+        }
+        .positive { color: var(--red); font-weight: 900; }
+        .negative { color: var(--green); font-weight: 900; }
+        .assistant-panel {
+            background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            padding: 1rem;
+            box-shadow: 0 16px 38px rgba(53, 73, 118, 0.09);
+            min-height: 520px;
+        }
+        .chat-bubble {
+            border-radius: 18px;
+            padding: 0.85rem 1rem;
+            background: #eef4ff;
+            color: #1f3566;
+            margin-bottom: 0.75rem;
+            font-weight: 700;
+        }
+        .entry-card {
+            min-height: 154px;
+            display: block;
+            color: inherit;
+            text-decoration: none;
+            transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+        }
+        .entry-card:hover {
+            transform: translateY(-2px);
+            border-color: rgba(79, 115, 255, 0.55);
+            box-shadow: 0 20px 44px rgba(53, 73, 118, 0.14);
+        }
+        .entry-title {
+            font-size: 1.05rem;
+            font-weight: 900;
+            margin-bottom: 0.38rem;
+        }
+        .entry-desc {
+            color: var(--muted);
+            font-size: 0.86rem;
+            min-height: 2.5rem;
+            line-height: 1.45;
+        }
+        .entry-status {
+            color: var(--primary);
+            font-weight: 900;
+            margin-top: 0.8rem;
+            font-size: 1rem;
+        }
+        [title] {
+            cursor: help;
+        }
+        .health-score {
+            display: flex;
+            align-items: center;
+            gap: 1.2rem;
+        }
+        .score-ring {
+            width: 150px;
+            aspect-ratio: 1;
+            border-radius: 50%;
+            background: conic-gradient(#34c96b 0 var(--score-deg), #edf1f8 var(--score-deg) 360deg);
+            display: grid;
+            place-items: center;
+        }
+        .score-ring span {
+            width: 68%;
+            aspect-ratio: 1;
+            border-radius: 50%;
+            background: white;
+            display: grid;
+            place-items: center;
+            font-size: 1.7rem;
+            font-weight: 900;
+        }
+        .news-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.72rem 0;
+            border-bottom: 1px solid #edf1f8;
+            color: #26324a;
+            font-size: 0.9rem;
+        }
+        .news-row:last-child { border-bottom: 0; }
+        @media (max-width: 900px) {
+            .dashboard-title { display: block; }
+            .donut-wrap { grid-template-columns: 1fr; }
+            .holdings-grid { grid-template-columns: 1fr !important; }
+            .health-score { display: block; }
+            .score-ring { margin-bottom: 1rem; }
+            .metric-value { font-size: 1.45rem; }
+            .entry-desc { min-height: auto; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_metric_card(label, value, help_text="", delta="", accent="#4f73ff", soft="#edf3ff", tooltip=""):
+    title_attr = f' title="{escape(tooltip)}"' if tooltip else ""
+    st.markdown(
+        f"""
+        <div class="soft-card metric-card" style="--accent:{accent};--accent-soft:{soft};">
+            <div class="metric-label">{escape(label)}</div>
+            <div class="metric-value"{title_attr}>{escape(value)}</div>
+            <div class="metric-delta">{escape(delta)}</div>
+            <div class="metric-help">{escape(help_text)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def set_active_section(section_name):
+    st.session_state["active_section"] = section_name
+
+
+def render_top_settings_card(cash):
+    st.markdown('<div class="settings-card">', unsafe_allow_html=True)
+    title_col, cash_col, save_col, refresh_col = st.columns([2.2, 1.5, 1, 1])
+    with title_col:
+        st.markdown("### 投資分析工具")
+        st.caption("規則式投資輔助分析，現價資料可能延遲，實際下單前請以券商報價為準。")
+    with cash_col:
+        updated_cash = st.number_input("本月可用現金", min_value=0.0, value=float(cash), step=1000.0)
+    with save_col:
+        save_clicked = st.button("保存現金", use_container_width=True)
+    with refresh_col:
+        refresh_clicked = st.button("重新讀取資料", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+    return updated_cash, save_clicked, refresh_clicked
+
+
+def render_entry_card(title, description, status, target_section, key):
+    section_url = quote(target_section)
+    st.markdown(
+        f"""
+        <a class="soft-card entry-card" href="?section={section_url}" target="_self">
+            <div class="entry-title">{escape(title)}</div>
+            <div class="entry-desc">{escape(description)}</div>
+            <div class="entry-status">{escape(status)}</div>
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_entry_cards(
+    stock_market_value,
+    cash,
+    total_unrealized_profit,
+    mortgage_buffer_months,
+    health_score,
+    holdings_count,
+):
+    st.markdown("### 功能入口")
+    entries = [
+        ("總覽儀表板", "回到資產概況、健康度與投資助理。", f"健康度 {health_score}/100", "總覽儀表板", "entry_dashboard"),
+        ("持股分析", "查看持股小卡、集中度與完整持股資料表。", f"{holdings_count} 檔持股", "持股分析", "entry_holdings"),
+        ("投資助理", "輸入問題，依持股、現金與風險狀態取得建議。", "可問加碼/賣出/大跌", "投資助理", "entry_assistant"),
+        ("現金與房貸", "檢查現金緩衝、房貸月繳與不動產資料。", f"{format_months(mortgage_buffer_months)}", "現金房貸", "entry_cash"),
+        ("買賣模擬", "試算買進或賣出後的現金與資產變化。", f"現金 {format_currency(cash)}", "買賣模擬", "entry_simulator"),
+        ("原始資料", "查看 Google CSV 交易紀錄與未納入持股項目。", f"損益 {format_currency(total_unrealized_profit)}", "原始資料", "entry_raw"),
+    ]
+    for start_index in range(0, len(entries), 3):
+        columns = st.columns(3)
+        for column, entry in zip(columns, entries[start_index : start_index + 3]):
+            with column:
+                render_entry_card(*entry)
+
+
+def render_asset_allocation_card(stock_market_value, cash, real_estate_value_total, overall_asset_total):
+    safe_total = overall_asset_total if overall_asset_total else 1
+    stock_ratio_value = stock_market_value / safe_total
+    cash_ratio_value = cash / safe_total
+    real_estate_ratio = real_estate_value_total / safe_total
+    stock_deg = stock_ratio_value * 360
+    cash_deg = (stock_ratio_value + cash_ratio_value) * 360
+    st.markdown(
+        f"""
+        <div class="soft-card">
+            <div class="section-title"><h3>資產配置</h3><span class="pill">總資產占比</span></div>
+            <div class="donut-wrap">
+                <div class="donut" style="--stock-deg:{stock_deg:.1f}deg;--cash-deg:{cash_deg:.1f}deg;">
+                    <div class="donut-inner"><div>股票<br>{stock_ratio_value * 100:.0f}%</div></div>
+                </div>
+                <div>
+                    <div class="legend-row"><span><span class="dot" style="background:#4f73ff"></span>股票</span><strong>{format_percent(stock_ratio_value)}</strong></div>
+                    <div class="legend-row"><span><span class="dot" style="background:#7fd8e4"></span>現金</span><strong>{format_percent(cash_ratio_value)}</strong></div>
+                    <div class="legend-row"><span><span class="dot" style="background:#ffd872"></span>不動產</span><strong>{format_percent(real_estate_ratio)}</strong></div>
+                    <div class="metric-help">股票 {format_currency(stock_market_value)} / 現金 {format_currency(cash)} / 房產 {format_currency(real_estate_value_total)}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_holding_card_html(row):
+    stock_id = str(row["\u80a1\u7968\u4ee3\u865f"])
+    stock_name = str(row["\u80a1\u7968\u540d\u7a31"])
+    return_rate = row["\u5831\u916c\u7387"]
+    profit = row["\u672a\u5be6\u73fe\u640d\u76ca"]
+    tone_class = "positive" if not pd.isna(profit) and profit >= 0 else "negative"
+    sign = "\u25b2" if tone_class == "positive" else "\u25bc"
+    current_price = format_price(row["\u73fe\u50f9"])
+    quantity = row["\u6301\u6709\u80a1\u6578"]
+    market_value = format_currency(row["\u76ee\u524d\u5e02\u503c"])
+    avg_cost = format_price(row["\u5e73\u5747\u6210\u672c"])
+    profit_text = format_currency(profit)
+    holding_ratio = format_percent(row.get("\u6301\u80a1\u4f54\u6bd4", pd.NA))
+    asset_ratio = format_percent(row.get("\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b", pd.NA))
+    price_history = get_price_history(stock_id)
+    sparkline_svg = build_sparkline_svg(price_history, positive=tone_class == "positive")
+    return f"""
+        <div class="holding-card">
+            <div class="holding-top">
+                <div>
+                    <div class="stock-code">{escape(stock_id)}</div>
+                    <div class="stock-name">{escape(stock_name)}</div>
+                </div>
+                <div class="{tone_class}" title="報酬率：目前未實現損益 / 總投入成本">{sign} {escape(format_percent(return_rate))}</div>
+            </div>
+            <div class="holding-price">$ {escape(current_price)}</div>
+            <div class="sparkline-wrap" title="最近 3 個月真實收盤價走勢，資料來源 Yahoo Finance">{sparkline_svg}</div>
+            <div class="card-grid">
+                <div><span>持有</span><strong>{quantity:,.0f} 股</strong></div>
+                <div><span>市值</span><strong>{escape(market_value)}</strong></div>
+                <div><span>成本</span><strong>{escape(avg_cost)}</strong></div>
+                <div><span>損益</span><strong class="{tone_class}">{escape(profit_text)}</strong></div>
+                <div title="持股占比：此股票市值占股票總市值比例"><span>持股占比</span><strong>{escape(holding_ratio)}</strong></div>
+                <div title="總資產占比：此股票市值占股票＋現金總資產比例"><span>總資產占比</span><strong>{escape(asset_ratio)}</strong></div>
+            </div>
+        </div>
+        """
+
+
+def render_holding_card(row):
+    st.markdown(build_holding_card_html(row), unsafe_allow_html=True)
+
+
+def render_holding_cards(holdings, allow_expand=True, cards_per_row=3):
+    st.markdown(
+        f"""
+        <div class="soft-card">
+            <div class="section-title">
+                <h3>持股總覽</h3>
+                <span class="pill">每列最多 {cards_per_row} 檔</span>
+            </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if holdings.empty:
+        st.info("目前沒有可顯示的持股。")
+    else:
+        sorted_holdings = holdings.sort_values("\u76ee\u524d\u5e02\u503c", ascending=False)
+        show_all = bool(st.session_state.get("show_all_holdings", False))
+        visible_holdings = sorted_holdings if show_all else sorted_holdings.head(6)
+        for start_index in range(0, len(visible_holdings), cards_per_row):
+            columns = st.columns(cards_per_row)
+            for column, (_, row) in zip(
+                columns,
+                visible_holdings.iloc[start_index : start_index + cards_per_row].iterrows(),
+            ):
+                with column:
+                    render_holding_card(row)
+        if allow_expand and len(sorted_holdings) > 6:
+            button_label = "收合持股" if show_all else f"查看更多（共 {len(sorted_holdings)} 檔）"
+            if st.button(button_label, key="toggle_holdings", use_container_width=True):
+                st.session_state["show_all_holdings"] = not show_all
+                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def calculate_portfolio_health_score(holdings, overall_return, stock_market_value, overall_asset_total, mortgage_buffer_months):
+    score = 100
+    if not pd.isna(mortgage_buffer_months):
+        if mortgage_buffer_months < 6:
+            score -= 24
+        elif mortgage_buffer_months < 12:
+            score -= 10
+    if not holdings.empty and "\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b" in holdings.columns:
+        max_ratio = holdings["\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b"].max(skipna=True)
+        if not pd.isna(max_ratio) and max_ratio > STOCK_NO_ADD_THRESHOLD:
+            score -= 14
+    if overall_return < 0:
+        score -= 12
+    exposure = stock_market_value / overall_asset_total if overall_asset_total else 0
+    if exposure > 0.65:
+        score -= 10
+    return max(0, min(100, int(score)))
+
+
+def render_health_card(score, mortgage_buffer_months, cash_gap_to_12m_mortgage, holdings):
+    status = "良好" if score >= 75 else "注意" if score >= 55 else "偏弱"
+    score_deg = score * 3.6
+    concentration_note = "持股分散尚可"
+    if not holdings.empty and "\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b" in holdings.columns:
+        max_row = holdings.sort_values("\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b", ascending=False).iloc[0]
+        concentration_note = (
+            f"{max_row['\u80a1\u7968\u4ee3\u865f']} 占總資產 "
+            f"{format_percent(max_row['\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b'])}"
+        )
+    cash_note = (
+        f"現金可支撐 {format_months(mortgage_buffer_months)}"
+        if not pd.isna(mortgage_buffer_months)
+        else "目前沒有房貸月繳資料"
+    )
+    gap_note = (
+        f"距 12 個月房貸水位差 {format_currency(max(cash_gap_to_12m_mortgage, 0))}"
+        if cash_gap_to_12m_mortgage > 0
+        else "現金已達 12 個月房貸安全水位"
+    )
+    st.markdown(
+        f"""
+        <div class="soft-card">
+            <div class="section-title"><h3>投資組合健康度</h3><span class="pill">{escape(status)}</span></div>
+            <div class="health-score">
+                <div class="score-ring" title="健康度：依現金水位、集中度、股票曝險計算的簡化分數" style="--score-deg:{score_deg:.1f}deg;"><span>{score}<small>/100</small></span></div>
+                <div>
+                    <div class="legend-row"><span>資產配置</span><strong>{escape(concentration_note)}</strong></div>
+                    <div class="legend-row"><span>現金水位</span><strong>{escape(cash_note)}</strong></div>
+                    <div class="legend-row"><span>房貸緩衝</span><strong>{escape(gap_note)}</strong></div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_market_overview_card(overall_return, cash_ratio, stock_market_value, total_unrealized_profit):
+    cards = [
+        ("股票曝險", format_currency(stock_market_value), "目前股票總市值"),
+        ("現金比重", format_percent(cash_ratio), "股票與現金資產內"),
+        ("帳面損益", format_currency(total_unrealized_profit), format_percent(overall_return)),
+    ]
+    st.markdown(
+        '<div class="soft-card"><div class="section-title"><h3>市場總覽</h3><span class="pill">投組摘要</span></div>',
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(3)
+    for column, (title, value, note) in zip(columns, cards):
+        with column:
+            st.markdown(
+                f"""
+                <div class="holding-card" style="min-height:120px;">
+                    <div class="stock-name">{escape(title)}</div>
+                    <div class="holding-price">{escape(value)}</div>
+                    <div class="metric-help">{escape(note)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_news_card(cash_gap_to_12m_mortgage, monthly_mortgage_total, total_unrealized_profit, holdings):
+    observations = [
+        (
+            "現金水位",
+            "現金水位偏低，建議優先保留房貸與生活緩衝。"
+            if cash_gap_to_12m_mortgage > 0
+            else "現金安全水位充足，可維持原定投資節奏。",
+        )
+    ]
+    if not holdings.empty:
+        profit_rows = holdings.dropna(subset=["\u5831\u916c\u7387"]).sort_values("\u5831\u916c\u7387", ascending=False)
+        if not profit_rows.empty:
+            best_row = profit_rows.iloc[0]
+            if best_row["\u5831\u916c\u7387"] > 0.2:
+                observations.append(
+                    (
+                        str(best_row["\u80a1\u7968\u4ee3\u865f"]),
+                        f"{best_row['\u80a1\u7968\u540d\u7a31']} 帳面獲利較高，短線追價宜保守。",
+                    )
+                )
+        ratio_rows = holdings.dropna(subset=["\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b"]).sort_values(
+            "\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b",
+            ascending=False,
+        )
+        if not ratio_rows.empty:
+            top_row = ratio_rows.iloc[0]
+            if top_row["\u4f54\u7e3d\u8cc7\u7522\u6bd4\u4f8b"] > STOCK_CONCENTRATION_WARNING_THRESHOLD:
+                observations.append(
+                    (
+                        str(top_row["\u80a1\u7968\u4ee3\u865f"]),
+                        f"{top_row['\u80a1\u7968\u540d\u7a31']} 單一標的比重偏高，留意波動。",
+                    )
+                )
+    observations.append(("投資損益", f"目前未實現損益 {format_currency(total_unrealized_profit)}，建議定期檢視。"))
+    observations = observations[:3]
+    st.markdown(
+        '<div class="soft-card"><div class="section-title"><h3>市場觀察</h3><span class="pill">依目前資料</span></div>',
+        unsafe_allow_html=True,
+    )
+    for title, text in observations:
+        st.markdown(
+            f'<div class="news-row"><strong>{escape(title)}</strong><span>{escape(text)}</span></div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_dashboard_assistant(holdings_df, cash, stock_market_value, overall_asset_total, monthly_mortgage_total, mortgage_buffer_months):
+    st.markdown(
+        '<div class="assistant-panel"><div class="section-title"><h3>投資決策助手</h3><span class="pill">AI</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="chat-bubble">可以問：00919 可以加碼嗎？群創要不要賣？台股大跌怎麼辦？</div>',
+        unsafe_allow_html=True,
+    )
+    with st.form("dashboard_assistant_form"):
+        assistant_question = st.text_input(
+            "輸入投資問題",
+            value="",
+            placeholder="輸入你的投資問題...",
+            label_visibility="collapsed",
+        )
+        assistant_submitted = st.form_submit_button("送出")
+    if assistant_question.strip() and assistant_submitted:
+        answer = build_investment_assistant_answer(
+            assistant_question,
+            holdings_df,
+            cash,
+            stock_market_value,
+            overall_asset_total,
+            monthly_mortgage_total,
+            mortgage_buffer_months,
+        )
+        st.markdown(f"**結論：{answer['conclusion']}**")
+        for reason in answer["reasons"][:2]:
+            st.caption(reason)
+        st.info(answer["action"])
+    else:
+        st.caption("回答會依照目前持股、成本、現金水位、房貸緩衝與持股比例產生。")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_dashboard(
+    holdings_df,
+    cash,
+    stock_market_value,
+    total_unrealized_profit,
+    overall_return,
+    overall_asset_total,
+    real_estate_value_total,
+    monthly_mortgage_total,
+    mortgage_buffer_months,
+    cash_gap_to_12m_mortgage,
+    cash_ratio,
+    data_status_message,
+):
+    health_score = calculate_portfolio_health_score(
+        holdings_df,
+        overall_return,
+        stock_market_value,
+        overall_asset_total,
+        mortgage_buffer_months,
+    )
+    st.markdown(
+        f"""
+        <div class="dashboard-title">
+            <div>
+                <h1>總覽儀表板</h1>
+                <p>掌握資產全貌，做出更明確的投資決策</p>
+            </div>
+            <span class="status-badge"><span class="status-dot"></span>{escape(data_status_message)}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    metric_columns = st.columns(5)
+    with metric_columns[0]:
+        render_metric_card(
+            "總資產",
+            f"$ {format_compact_currency(overall_asset_total)}",
+            "股票 + 現金 + 房產",
+            accent="#7b5cff",
+            soft="#f1edff",
+            tooltip=f"完整金額：{format_currency(overall_asset_total)}",
+        )
+    with metric_columns[1]:
+        render_metric_card(
+            "股票市值",
+            f"$ {format_compact_currency(stock_market_value)}",
+            "目前持股市值",
+            delta=format_percent(overall_return),
+            accent="#2f72ff",
+            soft="#eaf2ff",
+            tooltip=f"完整金額：{format_currency(stock_market_value)}",
+        )
+    with metric_columns[2]:
+        render_metric_card(
+            "現金",
+            f"$ {format_compact_currency(cash)}",
+            "可動用資金",
+            accent="#0f9f7a",
+            soft="#e9fbf3",
+            tooltip=f"完整金額：{format_currency(cash)}",
+        )
+    with metric_columns[3]:
+        render_metric_card(
+            "未實現損益",
+            f"$ {format_compact_currency(total_unrealized_profit)}",
+            "帳面損益",
+            delta=format_percent(overall_return),
+            accent="#d8701f",
+            soft="#fff2df",
+            tooltip=f"完整金額：{format_currency(total_unrealized_profit)}",
+        )
+    with metric_columns[4]:
+        render_metric_card("健康度", f"{health_score}/100", f"現金可支撐 {format_months(mortgage_buffer_months)}", accent="#d83f72", soft="#fff0f5")
+
+    left, right = st.columns([2.6, 1])
+    with left:
+        render_holding_cards(holdings_df, cards_per_row=3)
+    with right:
+        render_dashboard_assistant(holdings_df, cash, stock_market_value, overall_asset_total, monthly_mortgage_total, mortgage_buffer_months)
+
+    render_entry_cards(
+        stock_market_value,
+        cash,
+        total_unrealized_profit,
+        mortgage_buffer_months,
+        health_score,
+        len(holdings_df),
+    )
+
+    bottom_left, bottom_mid, bottom_right = st.columns(3)
+    with bottom_left:
+        render_asset_allocation_card(stock_market_value, cash, real_estate_value_total, overall_asset_total)
+    with bottom_mid:
+        render_health_card(health_score, mortgage_buffer_months, cash_gap_to_12m_mortgage, holdings_df)
+    with bottom_right:
+        render_news_card(cash_gap_to_12m_mortgage, monthly_mortgage_total, total_unrealized_profit, holdings_df)
+
+
+def render_back_to_dashboard():
+    if st.button("回到總覽儀表板", use_container_width=False):
+        set_active_section("總覽儀表板")
+        st.rerun()
+
+
+def render_compact_trade_simulator(holdings_df, cash, stock_market_value, monthly_mortgage_total):
+    render_back_to_dashboard()
+    st.header("買賣模擬")
+    st.caption("以目前行情與既有費率估算交易後現金、股票市值與配置變化。")
+
+    simulator_columns = st.columns([1, 1, 1])
+    simulation_action = simulator_columns[0].selectbox("操作類型", ["買進", "賣出", "只查詢"])
+    simulation_stock_id = simulator_columns[1].text_input("股票代號", value="", placeholder="例如：0050、2330、00679B")
+    simulation_stock_id = simulation_stock_id.strip().upper()
+
+    if not simulation_stock_id:
+        st.info("輸入股票代號後開始模擬。")
+        return
+
+    current_holding = find_holding(holdings_df, simulation_stock_id)
+    lookup_price = (
+        float(current_holding["\u73fe\u50f9"])
+        if current_holding is not None and not pd.isna(current_holding["\u73fe\u50f9"])
+        else get_current_price(simulation_stock_id)
+    )
+    if lookup_price is None or pd.isna(lookup_price):
+        st.error("行情資料暫時無法更新。")
+        return
+
+    stock_name = (
+        str(current_holding["\u80a1\u7968\u540d\u7a31"])
+        if current_holding is not None
+        else get_stock_name(simulation_stock_id) or simulation_stock_id
+    )
+
+    if simulation_action == "只查詢":
+        if current_holding is not None:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "股票代號": simulation_stock_id,
+                            "股票名稱": stock_name,
+                            "現價": format_price(lookup_price),
+                            "持有股數": f"{current_holding['\u6301\u6709\u80a1\u6578']:,.0f}",
+                            "平均成本": format_price(current_holding["\u5e73\u5747\u6210\u672c"]),
+                            "未實現損益": format_currency(current_holding["\u672a\u5be6\u73fe\u640d\u76ca"]),
+                            "報酬率": format_percent(current_holding["\u5831\u916c\u7387"]),
+                        }
+                    ]
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.info(f"{simulation_stock_id} 尚未持有，目前參考價格 {format_price(lookup_price)}。")
+        return
+
+    input_columns = st.columns(2)
+    simulation_price = input_columns[0].number_input("模擬價格", min_value=0.0, value=float(lookup_price), step=0.01)
+    if simulation_action == "買進":
+        simulation_lots = input_columns[1].number_input("買進張數", min_value=0.0, value=1.0, step=1.0)
+        simulation_quantity = simulation_lots * SHARES_PER_LOT
+    else:
+        default_quantity = float(current_holding["\u6301\u6709\u80a1\u6578"]) if current_holding is not None else 0.0
+        simulation_quantity = input_columns[1].number_input("賣出股數", min_value=0.0, value=default_quantity, step=100.0)
+
+    if simulation_price <= 0 or simulation_quantity <= 0:
+        return
+
+    simulation_market_value = simulation_price * simulation_quantity
+    simulation_brokerage_fee, simulation_transaction_tax = estimate_trade_fee(
+        simulation_stock_id,
+        simulation_market_value,
+        simulation_action,
+    )
+    simulation_total_fee = simulation_brokerage_fee + simulation_transaction_tax
+
+    if simulation_action == "買進":
+        simulated_cash = cash - simulation_market_value - simulation_brokerage_fee
+    else:
+        if current_holding is None:
+            st.warning("目前沒有持有這檔股票，無法模擬賣出。")
+            return
+        if simulation_quantity > float(current_holding["\u6301\u6709\u80a1\u6578"]):
+            st.warning("模擬賣出股數高於目前持有股數。")
+        simulated_cash = cash + simulation_market_value - simulation_total_fee
+
+    simulated_holdings = build_simulated_holdings(
+        holdings_df,
+        simulation_stock_id,
+        stock_name,
+        simulation_action,
+        simulation_quantity,
+        simulation_price,
+    )
+    simulated_stock_market_value = simulated_holdings["\u6a21\u64ec\u5f8c\u5e02\u503c"].sum(skipna=True)
+    simulated_total_assets = simulated_stock_market_value + simulated_cash
+
+    metrics = st.columns(5)
+    metrics[0].metric("交易金額", format_currency(simulation_market_value))
+    metrics[1].metric("手續費", format_currency(simulation_brokerage_fee))
+    metrics[2].metric("交易稅", format_currency(simulation_transaction_tax))
+    metrics[3].metric("模擬後現金", format_currency(simulated_cash))
+    metrics[4].metric("模擬後股票+現金", format_currency(simulated_total_assets))
+
+    if simulation_action == "買進":
+        render_mortgage_cashflow_check(simulated_cash, monthly_mortgage_total)
+    st.dataframe(build_simulation_display(simulated_holdings), use_container_width=True)
+
+
 st.set_page_config(page_title="投資分析工具", layout="wide")
-st.title("投資分析工具")
-st.warning(
-    "本工具為規則式投資輔助分析，並非保證獲利或正式投資建議。"
-    "現價資料來源可能延遲，實際下單前請以券商報價為準。"
-)
-st.info(
-    "目前成本採 FIFO 先進先出法估算；若券商成本計算方式不同，結果可能與券商 App 略有差異。"
-)
-st.info(
-    "現價會優先嘗試台灣證交所 / 櫃買中心報價，再使用 yfinance 備援；資料可能不是即時報價，僅供估算參考。"
-)
-st.info(
-    "預估損益已扣除估算賣出手續費與交易稅；手續費以 0.1425% 估算，"
-    "ETF 交易稅以 0.1% 估算，一般股票交易稅以 0.3% 估算。"
-)
-st.info(
-    "帳面報酬率：只看目前市值與成本的差異。\n\n"
-    "扣除交易成本後報酬率：估算如果賣出後，扣除手續費與交易稅後的結果。\n\n"
-    "持股佔比：看這檔標的在所有股票裡佔多少。\n\n"
-    "總資產比例：看這檔標的在股票加現金總資產裡佔多少。"
-)
+inject_dashboard_css()
+
+if "active_section" not in st.session_state:
+    st.session_state["active_section"] = "總覽儀表板"
+query_section = st.query_params.get("section")
+if query_section:
+    st.session_state["active_section"] = query_section
 
 settings = load_settings()
 saved_cash = float(settings.get("cash", 0.0))
-cash = st.number_input("現金", min_value=0.0, value=saved_cash, step=1000.0)
+cash, save_cash_clicked, refresh_clicked = render_top_settings_card(saved_cash)
 
-control_columns = st.columns([1, 1, 6])
-if control_columns[0].button("保存現金"):
+if save_cash_clicked:
     settings["cash"] = cash
     save_settings(settings)
     st.success("現金已保存，下次開啟會自動帶入。")
-if control_columns[1].button("重新讀取資料"):
+if refresh_clicked:
     st.cache_data.clear()
     st.rerun()
 
+with st.expander("資料說明"):
+    st.caption("本工具為規則式投資輔助分析，並非保證獲利或正式投資建議。")
+    st.caption("成本採 FIFO 先進先出法估算；券商 App 可能因成本算法不同而略有差異。")
+    st.caption("現價優先使用 TWSE MIS 或 Yahoo Finance，資料可能延遲。")
+    st.caption("預估損益已扣除估算賣出手續費與交易稅。")
+
 transactions_df, csv_error = read_holdings_csv(HOLDINGS_CSV_URL)
+data_status_message = "即時更新成功"
 
 if transactions_df is not None:
     st.session_state["last_successful_transactions_df"] = transactions_df.copy()
     save_transactions_cache(transactions_df)
     st.success("Google 試算表讀取成功")
 else:
+    data_status_message = "資料來源異常"
     st.error(
         "Google 試算表 CSV 讀取失敗："
         + str(csv_error)
@@ -1496,12 +2526,14 @@ else:
 
     if "last_successful_transactions_df" in st.session_state:
         transactions_df = st.session_state["last_successful_transactions_df"].copy()
+        data_status_message = "使用快取資料"
         st.warning("目前使用上一次成功讀取的資料")
     else:
         cached_transactions_df = load_transactions_cache()
         if cached_transactions_df is not None:
             transactions_df = cached_transactions_df
             st.session_state["last_successful_transactions_df"] = transactions_df.copy()
+            data_status_message = "使用快取資料"
             st.warning("目前使用本機上一次成功讀取的快取資料")
         else:
             st.error("尚未有成功讀取過的 Google CSV 資料，目前無法分析。")
@@ -1580,6 +2612,84 @@ stock_cash_total = stock_market_value + cash
 mortgage_buffer_months = cash / monthly_mortgage_total if monthly_mortgage_total else pd.NA
 mortgage_safety_level_12m = monthly_mortgage_total * 12
 cash_gap_to_12m_mortgage = mortgage_safety_level_12m - cash
+active_section = st.session_state.get("active_section", "總覽儀表板")
+
+if active_section == "總覽儀表板":
+    render_dashboard(
+        holdings_df,
+        cash,
+        stock_market_value,
+        total_unrealized_profit,
+        overall_return,
+        overall_asset_total,
+        real_estate_value_total,
+        monthly_mortgage_total,
+        mortgage_buffer_months,
+        cash_gap_to_12m_mortgage,
+        cash_ratio,
+        data_status_message,
+    )
+    st.stop()
+
+if active_section == "投資助理":
+    render_back_to_dashboard()
+    st.header("投資決策助手")
+    render_dashboard_assistant(
+        holdings_df,
+        cash,
+        stock_market_value,
+        overall_asset_total,
+        monthly_mortgage_total,
+        mortgage_buffer_months,
+    )
+    st.stop()
+
+if active_section == "持股分析":
+    render_back_to_dashboard()
+    st.header("持股分析")
+    render_holding_cards(holdings_df)
+    st.header("需要注意的標的")
+    watchlist_df = build_watchlist(holdings_df)
+    if watchlist_df.empty:
+        st.success("目前沒有需要特別注意的標的。")
+    else:
+        st.dataframe(watchlist_df, use_container_width=True)
+    with st.expander("查看完整持股明細", expanded=True):
+        st.dataframe(build_display_holdings(holdings_df), use_container_width=True)
+    st.stop()
+
+if active_section == "現金房貸":
+    render_back_to_dashboard()
+    st.header("現金流與不動產")
+    overview_row = st.columns(4)
+    overview_row[0].metric("現金", format_currency(cash))
+    overview_row[1].metric("每月房貸支出", format_currency(monthly_mortgage_total))
+    overview_row[2].metric("現金可支撐房貸月數", format_months(mortgage_buffer_months))
+    overview_row[3].metric("12 個月房貸缺口", format_currency(max(cash_gap_to_12m_mortgage, 0)))
+    if real_estate_status_message:
+        st.error(real_estate_status_message)
+    else:
+        st.dataframe(build_display_real_estate(real_estate_df), use_container_width=True)
+        with st.expander("進階不動產估算資料"):
+            st.dataframe(build_display_advanced_real_estate(real_estate_df), use_container_width=True)
+            st.table(build_real_estate_summary_table(real_estate_value_total, future_mortgage_payment_total))
+    st.stop()
+
+if active_section == "買賣模擬":
+    render_compact_trade_simulator(holdings_df, cash, stock_market_value, monthly_mortgage_total)
+    st.stop()
+
+if active_section == "原始資料":
+    render_back_to_dashboard()
+    st.header("原始資料")
+    with st.expander("未納入持股計算的交易", expanded=True):
+        st.dataframe(
+            excluded_transactions_df.drop(columns=["交易日期_排序", "原始順序"], errors="ignore"),
+            use_container_width=True,
+        )
+    with st.expander("原始交易紀錄", expanded=True):
+        st.dataframe(transactions_df, use_container_width=True)
+    st.stop()
 
 st.header("現金流與資產總覽")
 overall_row_1 = st.columns(4)
